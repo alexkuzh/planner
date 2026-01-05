@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any
+
 from app.models.task import TaskStatus
 
 
@@ -7,32 +11,101 @@ class TransitionNotAllowed(Exception):
     pass
 
 
-# action -> (from_status, to_status)
-TRANSITIONS: dict[str, tuple[TaskStatus, TaskStatus]] = {
-    "start": (TaskStatus.new, TaskStatus.in_progress),
-    "finish": (TaskStatus.in_progress, TaskStatus.done),
-    "reopen": (TaskStatus.done, TaskStatus.in_progress),
+class Action(str, Enum):
+    PLAN = "plan"
+    ASSIGN = "assign"
+    UNASSIGN = "unassign"
+    START = "start"
+    SUBMIT = "submit"
+    APPROVE = "approve"
+    REJECT = "reject"
+    CANCEL = "cancel"
+
+
+@dataclass(frozen=True)
+class SideEffect:
+    """Declarative side effects for the service layer to execute."""
+    kind: str
+    payload: dict[str, Any]
+
+
+# Какие статусы считаем "не финальными"
+NON_TERMINAL = {
+    TaskStatus.new,
+    TaskStatus.planned,
+    TaskStatus.assigned,
+    TaskStatus.in_progress,
+    TaskStatus.in_review,
+}
+
+TERMINAL = {
+    TaskStatus.done,
+    TaskStatus.rejected,
+    TaskStatus.canceled,
 }
 
 
-def apply_transition(current: TaskStatus, action: str) -> TaskStatus:
+# action -> allowed from statuses + to status
+# Важно: start только из assigned (а не из new)
+TRANSITIONS: dict[Action, tuple[set[TaskStatus], TaskStatus]] = {
+    Action.PLAN: ({TaskStatus.new}, TaskStatus.planned),
+    Action.ASSIGN: ({TaskStatus.new, TaskStatus.planned}, TaskStatus.assigned),
+    Action.UNASSIGN: ({TaskStatus.assigned}, TaskStatus.planned),
+
+    Action.START: ({TaskStatus.assigned}, TaskStatus.in_progress),
+    Action.SUBMIT: ({TaskStatus.in_progress}, TaskStatus.in_review),
+
+    Action.APPROVE: ({TaskStatus.in_review}, TaskStatus.done),
+    Action.REJECT: ({TaskStatus.in_review}, TaskStatus.rejected),
+
+    Action.CANCEL: (NON_TERMINAL, TaskStatus.canceled),
+}
+
+
+def apply_transition(
+    current: TaskStatus,
+    action_raw: str,
+    *,
+    payload: dict[str, Any] | None = None,
+) -> tuple[TaskStatus, list[SideEffect]]:
     """
-    Apply a transition action to the current TaskStatus and return the new status.
-
-    Rules:
-      - action must exist in TRANSITIONS
-      - current status must match the expected 'from' status for that action
+    Returns (new_status, side_effects).
+    Side effects are executed by the service layer in the same DB transaction.
     """
-    action = action.strip()
+    payload = payload or {}
+    action_raw = action_raw.strip()
 
-    if action not in TRANSITIONS:
-        allowed = ", ".join(sorted(TRANSITIONS.keys()))
-        raise TransitionNotAllowed(f"Unknown action: '{action}'. Allowed actions: {allowed}")
+    try:
+        action = Action(action_raw)
+    except ValueError:
+        allowed = ", ".join(a.value for a in Action)
+        raise TransitionNotAllowed(f"Unknown action: '{action_raw}'. Allowed actions: {allowed}")
 
-    expected_from, to_status = TRANSITIONS[action]
-    if current != expected_from:
+    allowed_from, to_status = TRANSITIONS[action]
+    if current not in allowed_from:
+        allowed_from_str = ", ".join(sorted(s.value for s in allowed_from))
         raise TransitionNotAllowed(
-            f"Action '{action}' not allowed from status '{current.value}'. "
-            f"Expected '{expected_from.value}'."
+            f"Action '{action.value}' not allowed from status '{current.value}'. "
+            f"Allowed from: {allowed_from_str}."
         )
-    return to_status
+
+    side_effects: list[SideEffect] = []
+
+    # Reject => create fix-task (в MVP — всегда, чтобы не было "сломал данные")
+    if action is Action.REJECT:
+        reason = (payload.get("reason") or "").strip()
+        fix_title = (payload.get("fix_title") or "").strip()
+        assign_to = payload.get("assign_to")  # optional user_id
+
+        side_effects.append(
+            SideEffect(
+                kind="create_fix_task",
+                payload={
+                    "reason": reason,
+                    "fix_title": fix_title,
+                    "assign_to": assign_to,
+                },
+            )
+        )
+
+    return to_status, side_effects

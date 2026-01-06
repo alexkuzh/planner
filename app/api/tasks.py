@@ -17,12 +17,20 @@ from app.schemas.transition import TaskTransitionRequest, TaskTransitionResponse
 from app.models.task import Task, TaskStatus
 from app.models.task_event import TaskEvent
 from app.models.task_transition import TaskTransition
+from app.models.deliverable import Deliverable
 
 
 router = APIRouter()
 
 @router.post("/tasks", response_model=TaskRead, status_code=status.HTTP_201_CREATED)
 def create_task(data: TaskCreate, db: Session = Depends(get_db)):
+    if data.deliverable_id is not None:
+        d = db.get(Deliverable, data.deliverable_id)
+        if not d:
+            raise HTTPException(status_code=404, detail="Deliverable not found")
+        if d.org_id != data.org_id:
+            raise HTTPException(status_code=422, detail="Deliverable org_id mismatch")
+
     task = Task(
         org_id=data.org_id,
         project_id=data.project_id,
@@ -31,6 +39,12 @@ def create_task(data: TaskCreate, db: Session = Depends(get_db)):
         description=data.description,
         priority=data.priority,
         status=TaskStatus.new.value,  # или просто "new"
+
+        kind=data.kind.value if hasattr(data.kind, "value") else str(data.kind),
+        other_kind_label=data.other_kind_label,
+
+        deliverable_id=data.deliverable_id,
+        is_milestone=data.is_milestone,
     )
     db.add(task)
     db.commit()

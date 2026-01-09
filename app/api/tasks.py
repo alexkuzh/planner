@@ -1,6 +1,6 @@
 # app/api/tasks.py
 
-from fastapi import APIRouter, Depends, HTTPException, status, Body
+from fastapi import APIRouter, Depends, HTTPException, status, Body, Query
 
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
@@ -26,34 +26,6 @@ from app.models.deliverable import Deliverable
 
 router = APIRouter(prefix="/tasks")
 
-@router.post("", response_model=TaskRead, status_code=status.HTTP_201_CREATED)
-def create_task(data: TaskCreate, db: Session = Depends(get_db)):
-    if data.deliverable_id is not None:
-        d = db.get(Deliverable, data.deliverable_id)
-        if not d:
-            raise HTTPException(status_code=404, detail="Deliverable not found")
-        if d.org_id != data.org_id:
-            raise HTTPException(status_code=422, detail="Deliverable org_id mismatch")
-
-    task = Task(
-        org_id=data.org_id,
-        project_id=data.project_id,
-        created_by=data.created_by,
-        title=data.title,
-        description=data.description,
-        priority=data.priority,
-        status=TaskStatus.new.value,  # или просто "new"
-
-        kind=data.kind.value if hasattr(data.kind, "value") else str(data.kind),
-        other_kind_label=data.other_kind_label,
-
-        deliverable_id=data.deliverable_id,
-        is_milestone=data.is_milestone,
-    )
-    db.add(task)
-    db.commit()
-    db.refresh(task)
-    return task
 
 TASK_TRANSITION_OPENAPI_EXAMPLES = {
     "plan": {
@@ -154,9 +126,46 @@ REPORT_FIX_OPENAPI_EXAMPLES = {
     }
 }
 
+@router.post("", response_model=TaskRead, status_code=status.HTTP_201_CREATED)
+def create_task(data: TaskCreate, db: Session = Depends(get_db)):
+    if data.deliverable_id is not None:
+        d = db.get(Deliverable, data.deliverable_id)
+        if not d:
+            raise HTTPException(status_code=404, detail="Deliverable not found")
+        if d.org_id != data.org_id:
+            raise HTTPException(status_code=422, detail="Deliverable org_id mismatch")
 
-@router.post("/{task_id}/transitions", response_model=TaskTransitionResponse,
-                                            response_model_exclude_none=True,)
+    task = Task(
+        org_id=data.org_id,
+        project_id=data.project_id,
+        created_by=data.created_by,
+        title=data.title,
+        description=data.description,
+        priority=data.priority,
+        status=TaskStatus.new.value,  # или просто "new"
+
+        kind=data.kind.value if hasattr(data.kind, "value") else str(data.kind),
+        other_kind_label=data.other_kind_label,
+
+        deliverable_id=data.deliverable_id,
+        is_milestone=data.is_milestone,
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+@router.post("/{task_id}/transitions",
+            response_model=TaskTransitionResponse,
+            response_model_exclude_none=True,
+            summary="Apply FSM transition to task",
+            description=(
+                "Применяет действие FSM к задаче (например: plan/assign/start/submit/approve/reject).\n\n"
+                "Требует optimistic lock: expected_row_version должен совпадать с текущим row_version задачи.\n"
+                "payload зависит от action (см. примеры в Swagger)."
+                ),
+            )
 def transition_task(
     task_id: UUID,
     payload: TaskTransitionRequest = Body(..., openapi_examples=TASK_TRANSITION_OPENAPI_EXAMPLES),
@@ -191,7 +200,19 @@ def transition_task(
 
 
 @router.post("/{task_id}/dependencies", status_code=201)
-def add_dependency(task_id: UUID, org_id: UUID, created_by: UUID, body: TaskDependencyCreate, db: Session = Depends(get_db)):
+def add_dependency(
+        org_id: UUID = Query(
+        ...,
+            description="Организация (мультитенантность). Пока query, позже будет из auth.",
+            examples=["11111111-1111-1111-1111-111111111111"],
+        ),
+        created_by: UUID = Query(
+        ...,
+            description="Кто создал зависимость (audit). Пока query, позже будет из auth.",
+            examples=["33333333-3333-3333-3333-333333333333"],
+        ),
+        body: TaskDependencyCreate = Body(...),
+        db: Session = Depends(get_db)):
     """
     Создаёт зависимость predecessor -> successor(task_id).
     org_id и created_by пока query-параметры (позже заберём из auth).
@@ -236,8 +257,16 @@ def list_tasks(db: Session = Depends(get_db)):
     )
 
 
-@router.get("/{task_id}/transitions", response_model=list[TaskTransitionItem])
-def list_task_transitions(task_id: UUID, org_id: UUID, db: Session = Depends(get_db)):
+@router.get("/{task_id}/transitions", response_model=list[TaskTransitionItem], response_model_exclude_none=True, )
+def list_task_transitions(
+    task_id: UUID,
+    org_id: UUID = Query(
+        ...,
+        description="Организация (мультитенантность). Пока query, позже будет из auth.",
+        examples=["11111111-1111-1111-1111-111111111111"],
+    ),
+    db: Session = Depends(get_db),
+):
     """
     Timeline переходов FSM по задаче.
     org_id пока передаём query-параметром (мультитенантность), позже заменим на auth-context.
@@ -256,7 +285,15 @@ def list_task_transitions(task_id: UUID, org_id: UUID, db: Session = Depends(get
     return transitions
 
 @router.get("/{task_id}/dependencies", response_model=list[TaskDependencyRead])
-def list_dependencies(task_id: UUID, org_id: UUID, db: Session = Depends(get_db)):
+def list_dependencies(
+    task_id: UUID,
+    org_id: UUID = Query(
+        ...,
+        description="Организация (мультитенантность). Пока query, позже будет из auth.",
+        examples=["11111111-1111-1111-1111-111111111111"],
+    ),
+    db: Session = Depends(get_db),
+):
     rows = db.execute(
         text("""
             SELECT predecessor_id, successor_id, created_by, created_at
@@ -271,7 +308,15 @@ def list_dependencies(task_id: UUID, org_id: UUID, db: Session = Depends(get_db)
 
 
 @router.get("/{task_id}/blockers", response_model=list[TaskBlockerRead])
-def list_task_blockers(task_id: UUID, org_id: UUID, db: Session = Depends(get_db)):
+def list_task_blockers(
+    task_id: UUID,
+    org_id: UUID = Query(
+        ...,
+        description="Организация (мультитенантность). Пока query, позже будет из auth.",
+        examples=["11111111-1111-1111-1111-111111111111"],
+    ),
+    db: Session = Depends(get_db),
+):
     # проверка существования задачи в org
     task = db.execute(
         select(Task).where(Task.org_id == org_id, Task.id == task_id)

@@ -1,210 +1,238 @@
-# Planner — Architecture (MVP)
+# Planner — Architecture Overview
 
-## Goal
-Planner — сервис для управления производственным процессом по изделиям (deliverables) на базе шаблонов работ (DNA).  
-Стек: FastAPI + SQLAlchemy + Alembic + Postgres (docker-compose).  
-Ключевая особенность: управление жизненным циклом задач через FSM transitions + аудит событий.
+## 1. Цель системы
 
----
+Planner — это backend-система для управления производственными изделиями (deliverables), деревьями задач и контролем качества.
 
-## Core domain concepts
+Основная цель:
 
-### Deliverable (изделие / партия)
-Deliverable — агрегат процесса. Это единица, которую реально выпускают/проверяют.
+* обеспечить **прозрачный жизненный цикл изделия** от старта производства до QC-утверждения;
+* зафиксировать **ответственность** (sign-off) и **причины возвратов** (QC reject);
+* позволить расширение (milestones, QC-очереди, аналитика бонусов) без ломки ядра.
 
-- В одном проекте **только один тип deliverable** (упрощение MVP).
-- `serial` приходит извне (ERP/склад/заказ), внутри хранится как внешний идентификатор.
-- Deliverable хранит `template_version_id` — по какому “чертежу” развернули дерево задач.
-
-**Deliverable statuses (MVP):**
-- `open`
-- `submitted_to_qc`
-- `qc_approved`
-- `qc_rejected`
-
-**Gate в QC (MVP):**
-- deliverable можно переводить в `submitted_to_qc`, когда **все milestone tasks (`is_milestone=true`) = done**.
-- Если milestone задач нет — gate считается пройденным.
+Текущий фокус — **MVP**, с чётко зафиксированными инвариантами и отложенными фичами.
 
 ---
 
-### Task (работа)
-Task — единица работы внутри deliverable.  
-Структура задач представляет WBS дерево + зависимости (граф).
+## 2. Технологический стек
 
-- `deliverable_id` может быть NULL для задач, не относящихся к конкретному изделию (maintenance/admin/other).
-- `parent_task_id` — WBS-иерархия.
-- `task_dependencies` — зависимости `predecessor → successor`.
-- FSM + `task_events` фиксируют историю всех переходов.
-
-**Task statuses (общая идея):**
-- `new / planned / assigned / in_progress / in_review / rejected / done / canceled`
+* Python 3.13
+* FastAPI (REST API + Swagger)
+* SQLAlchemy ORM
+* Alembic (миграции)
+* PostgreSQL (Docker Compose)
+* FSM (явные переходы задач)
 
 ---
 
-## Task classification (важно)
+## 3. Ключевые доменные сущности
 
-### `tasks.kind` — доменная классификация
-`kind` описывает *что это за задача по природе* (домены/классы работ):
+### 3.1 Deliverable (изделие)
 
-- `production`
-- `maintenance`
-- `admin`
-- `other`
+Центральный агрегат домена.
 
-Это поле **НЕ** используется для различения “fix” задач.
+**Смысл:** конкретное изделие (или партия), производимое по шаблону.
 
-### `tasks.work_kind` — тип работы (ортогонально `kind`)
-`work_kind` описывает *тип выполнения*:
+**Ключевые поля:**
 
-- `work` — обычная плановая работа
-- `fix` — corrective / rework / исправление
+* `id`
+* `org_id`, `project_id`
+* `serial` (приходит извне)
+* `template_version_id` — по какой версии шаблона создано
+* `status`:
 
-`work_kind` ортогонален `kind`.  
-Например: `kind=production` и `work_kind=fix` — исправление производственного дефекта.
+  * `open`
+  * `submitted_to_qc`
+  * `qc_approved`
+  * `qc_rejected`
 
----
+**Важно:**
 
-## Fix-task (исправление)
-
-### Что такое fix-task
-Fix-task — это обычная Task со следующими признаками:
-
-- `work_kind = fix`
-- `fix_source` задан
-- `fix_severity` задан (MVP: default `minor`, если не указано)
-- `minutes_spent` опционально (для бонусов/аналитики)
-
-Связи:
-- `origin_task_id` — на какую задачу ссылается fix (если дефект обнаружен в конкретной задаче)
-- `qc_inspection_id` — если fix породился официальным QC reject
-
-### Источники fix-task (MVP)
-`fix_source`:
-- `qc_reject`
-- `worker_initiative`
-- `supervisor_request`
-
-`fix_severity`:
-- `minor`
-- `major`
-- `critical`
-
-### Инварианты fix-task (MVP, обязаны соблюдаться)
-- Если `work_kind = fix`:
-  - `fix_source IS NOT NULL`
-  - `fix_severity IS NOT NULL`
-- Если `work_kind = work`:
-  - `fix_source IS NULL`
-  - `fix_severity IS NULL`
+* статус deliverable — **агрегатный**, не меняется вручную;
+* зависит от sign-off и QC decision.
 
 ---
 
-## Allocations (распределение на смену/дату)
-Allocations — оперативное планирование (кто что делает в конкретный день/смену).
+### 3.2 Task (задача)
 
-- Лид “раздаёт” задачи ежедневно.
-- Allocation enrich’ится данными deliverable через join Task → Deliverable (serial и т.п.).
-- Allocation не является доменной “истиной”, а отражает план/назначение.
+Работы по изделию, образуют дерево (WBS).
 
----
+**Связи:**
 
-## Sign-off and QC
+* `deliverable_id` — может быть NULL (admin / maintenance / прочее)
+* `parent_task_id` — иерархия
+* `task_dependencies` — зависимости (predecessor → successor)
 
-### Production sign-off
-`deliverable_signoffs` фиксирует, кто “подписал” изделие (точка ответственности).
+**Жизненный цикл:**
 
-**MVP смысл sign-off (scope=full):**
-- “На момент подписи все задачи по deliverable выполнены”.
+* управляется FSM (`task_fsm.py`)
+* все переходы аудируются (`task_transitions`, `task_events`)
 
-Подпись — это не замена QC, а фиксация ответственности в производстве.
+**Ключевые поля:**
 
-### QC inspections
-`qc_inspections` фиксирует решение отдела QC по deliverable.
-
-- `approved` / `rejected`
-- При `rejected` обязателен `reason`.
-
-**При QC reject (MVP контракт):**
-- `qc_inspection.reason` обязателен
-- `responsible_user_id` вычисляется как `last approved signoff.signed_off_by`
-  - fallback (если signoff нет): deliverable.created_by / supervisor проекта (по настройке)
-- создаётся минимум один fix-task (`work_kind=fix`, `fix_source=qc_reject`, `qc_inspection_id` заполнен)
-- deliverable.status становится `qc_rejected`
+* `status`
+* `priority`
+* `is_milestone`
 
 ---
 
-## DNA изделия (шаблоны)
+### 3.3 Fix-task (исправление)
 
-### Entities
-- `ProjectTemplate` — шаблон проекта (у проекта одна активная версия)
-- `ProjectTemplateVersion` — версия “чертежа”
-- `ProjectTemplateNode` — дерево работ
-- `ProjectTemplateEdge` — зависимости
+**Fix-task — это НЕ отдельная сущность.**
 
-### Bootstrap service
-Bootstrap создаёт инстанс задач из активной версии:
+Это обычный `Task` со следующими признаками:
 
-1) берёт активную `ProjectTemplateVersion`  
-2) создаёт tasks (planned)  
-3) строит parent-child  
-4) копирует зависимости в `task_dependencies`  
-5) проставляет `deliverable.template_version_id`
+* `work_kind = fix`
+* `fix_source`:
 
----
+  * `qc_reject`
+  * `worker_initiative`
+  * `supervisor_request`
+* `fix_severity`: `minor | major | critical`
+* опционально:
 
-## MVP API (ориентир)
+  * `origin_task_id`
+  * `qc_inspection_id`
 
-### Deliverables
-- `POST /deliverables` — создать deliverable (serial приходит извне)
-- `POST /deliverables/{id}/bootstrap` — развернуть задачи по активному шаблону
-- `POST /deliverables/{id}/submit-to-qc` — gate: milestone done
-- `POST /deliverables/{id}/signoff` — scope=full (все задачи done)
-- `POST /deliverables/{id}/qc/inspect` — approve/reject
+**Инварианты:**
 
-### Tasks
-- `GET /deliverables/{id}/tasks`
-- `POST /tasks/{id}/transition` — FSM action
-- `POST /tasks/{id}/report-fix` — инициативный fix на origin_task
-
-### Fix tasks
-- `POST /deliverables/{id}/fix-tasks` — fix на deliverable без origin_task
-- `GET /deliverables/{id}/fix-tasks` — список исправлений
+* QC reject **обязан** создать минимум один fix-task
+* fix-task участвует в аналитике и бонусах
 
 ---
 
-## Permissions (MVP словами)
-Права на ключевые действия (базовая модель):
+### 3.4 DeliverableSignoff (production sign-off)
 
-- create deliverable: Project Owner / Intake
-- bootstrap: Project Owner / Supervisor (или System)
-- submit_to_qc: Lead / Worker (по правилам компании) + gate policy
-- qc_decision: QC Department
-- signoff(full): ответственный (Lead / Supervisor) — зависит от орг. структуры
-- allocations: Lead
+**Точка ответственности.**
 
----
+Фиксирует, кто подтвердил готовность изделия к QC.
 
-## Observability and audit
-- Все переходы задач фиксируются в `task_events`.
-- Важно избегать ручных правок статусов в БД: состояние должно меняться через сервисы/эндпоинты.
+**Поля:**
 
----
+* `signed_off_by`
+* `result`: `approved | rejected`
+* `comment`
 
-## Postponed (intentionally)
-- M5: QC по milestone (milestone_task_id в qc_inspections)
-- 16A/16B: QC очередь и отчёт возвратов QC по ответственным
+**Правило:**
+
+* `submit_to_qc` разрешён только если последний sign-off = `approved`
+* при QC reject `responsible_user_id` берётся из **последнего approved sign-off**
 
 ---
 
-## DevOps / Local run
-- Postgres в docker-compose (контейнер `planner_postgres`)
-- API можно запускать локально:
-  - `uvicorn app.main:app --reload --host 127.0.0.1 --port 8000`
+### 3.5 QC Inspection
+
+Решение отдела контроля качества.
+
+**Поля:**
+
+* `result`: `approved | rejected`
+* `notes` (обязательно при reject)
+* `inspector_user_id`
+* `responsible_user_id`
+
+**Поведение:**
+
+* `approved` → deliverable.status = `qc_approved`
+* `rejected` →
+
+  * deliverable.status = `qc_rejected`
+  * создаётся fix-task (`fix_source = qc_reject`)
 
 ---
 
-## Conventions
-- `kind` (production/maintenance/...) ≠ `work_kind` (work/fix)
-- Fix-task — не отдельная сущность, а Task с `work_kind=fix`.
-- `template_version_id` в deliverable — snapshot, не меняется задним числом.
+## 4. Шаблоны (DNA изделия)
+
+### 4.1 ProjectTemplateVersion
+
+Определяет структуру изделия:
+
+* узлы (`ProjectTemplateNode`)
+* зависимости (`ProjectTemplateEdge`)
+
+Один проект использует **одну активную версию** шаблона.
+
+---
+
+### 4.2 Bootstrap
+
+`POST /deliverables/{id}/bootstrap`
+
+**Назначение:**
+
+* развернуть задачи по шаблону
+* создать дерево задач
+* скопировать зависимости
+
+**Особенности:**
+
+* системное действие
+* **НЕ требует actor_user_id**
+* не влияет на ответственность
+
+---
+
+## 5. API-соглашения
+
+### 5.1 Command
+
+Для пользовательских действий используется обёртка:
+
+* `Command[T]`
+* содержит: `org_id`, `actor_user_id`, `expected_row_version`, `client_event_id`, `payload`
+
+Используется в:
+
+* transitions
+* report-fix
+* deliverable fix-tasks
+
+---
+
+### 5.2 Query vs Body
+
+* **Query:** системный контекст (org_id, project_id) — временно, до auth
+* **Body:** доменные действия
+
+---
+
+## 6. Инварианты (обязательные правила)
+
+1. QC reject → минимум один fix-task
+2. QC reject → `responsible_user_id` = last approved sign-off
+3. Deliverable status не меняется напрямую
+4. Sign-off — единственная точка ответственности
+5. Bootstrap не требует пользователя
+6. Fix-task всегда `work_kind = fix`
+
+---
+
+## 7. Отложено сознательно
+
+* **M5:** QC по milestone (`milestone_task_id` в qc_inspections)
+* **16A:** QC очередь
+* **16B:** отчёт возвратов QC по ответственным
+* Auth-context (замена org_id/query)
+* Расширенные роли (supervisor / lead / worker)
+
+---
+
+## 8. Объём и ожидания MVP
+
+* ~1 deliverable в неделю
+* ~50–200 задач на deliverable
+* Один тип deliverable в проекте
+* Serial приходит извне
+
+---
+
+## 9. Принципы дальнейшего развития
+
+* Не плодить сущности без необходимости
+* Явные инварианты важнее гибкости
+* Swagger = пользовательская документация
+* Сначала корректность, потом оптимизация
+
+---
+
+**Статус документа:** зафиксирован под текущий MVP

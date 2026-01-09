@@ -11,6 +11,7 @@ from app.models.task import Task, TaskStatus
 from app.models.task_transition import TaskTransition
 from app.fsm.task_fsm import apply_transition, TransitionNotAllowed
 
+FIX_EFFECT_CREATE = "create_fix_task"
 
 class VersionConflict(Exception):
     pass
@@ -57,12 +58,9 @@ def apply_task_transition(
             # Если это был reject и создали fix-task, он либо лежит как дочерняя по parent_task_id,
             # либо id лежит в payload связующего события.
             # Самый простой MVP: найти последнюю fix-task по parent_task_id.
-            if existing.action in ("reject", "fix_task_created"):
-                fix_task = db.execute(
-                    select(Task)
-                    .where(Task.org_id == org_id, Task.parent_task_id == task.id)
-                    .order_by(Task.created_at.desc())
-                ).scalar_one_or_none()
+            fix_task = None
+            if existing.payload and "fix_task_id" in existing.payload:
+                fix_task = db.get(Task, UUID(existing.payload["fix_task_id"]))
 
             return task, fix_task
 
@@ -120,7 +118,7 @@ def apply_task_transition(
 
     # 6) Side effects (reject => create fix-task)
     for eff in side_effects:
-        if eff.kind == "create_fix_task":
+        if eff.kind == FIX_EFFECT_CREATE:
             reason = (eff.payload.get("reason") or "").strip()
             fix_title = (eff.payload.get("fix_title") or "").strip()
             assign_to = eff.payload.get("assign_to")

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status, Body
+from fastapi import APIRouter, Depends, HTTPException, status, Body, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from uuid import UUID
@@ -10,7 +10,7 @@ from app.core.db import get_db
 from app.models.deliverable import Deliverable, DeliverableStatus
 from app.models.deliverable_signoff import DeliverableSignoff,SignoffResult
 from app.models.qc_inspection import QcInspection, QcResult
-from app.models.task import Task, TaskStatus, TaskKind, FixSource
+from app.models.task import Task, TaskStatus, TaskKind, FixSource, WorkKind, FixSource, FixSeverity
 
 from app.schemas.deliverable import DeliverableCreate, DeliverableRead
 from app.schemas.deliverable_signoff import DeliverableSignoffCreate, DeliverableSignoffRead
@@ -74,6 +74,44 @@ QC_DECISION_OPENAPI_EXAMPLES = {
     },
 }
 
+SUBMIT_TO_QC_OPENAPI_EXAMPLES = {
+    "submit": {
+        "summary": "Submit deliverable to QC",
+        "description": "Отправить изделие в QC. Требуется последний production sign-off со статусом approved.",
+        "value": {
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "project_id": "22222222-2222-2222-2222-222222222222",
+            "actor_user_id": "33333333-3333-3333-3333-333333333333"
+        }
+    }
+}
+
+SIGNOFF_OPENAPI_EXAMPLES = {
+    "approve": {
+        "summary": "Production sign-off (approve)",
+        "description": "Подтверждение, что все задачи по изделию выполнены.",
+        "value": {
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "project_id": "22222222-2222-2222-2222-222222222222",
+            "signed_off_by": "33333333-3333-3333-3333-333333333333",
+            "result": "approved",
+            "comment": "Все задачи выполнены, изделие готово к QC"
+        },
+    },
+    "reject": {
+        "summary": "Production sign-off (reject)",
+        "description": "Отклонение sign-off (редкий случай).",
+        "value": {
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "project_id": "22222222-2222-2222-2222-222222222222",
+            "signed_off_by": "33333333-3333-3333-3333-333333333333",
+            "result": "rejected",
+            "comment": "Не все задачи выполнены"
+        },
+    },
+}
+
+
 
 class DeliverableBootstrapResponse(BaseModel):
     template_version_id: UUID
@@ -127,8 +165,21 @@ def list_deliverables(org_id: UUID, project_id: UUID, db: Session = Depends(get_
     )
 
 
-@router.post("/{deliverable_id}/signoffs", response_model=DeliverableSignoffRead, status_code=status.HTTP_201_CREATED)
-def create_signoff(deliverable_id: UUID, body: DeliverableSignoffCreate, db: Session = Depends(get_db)):
+@router.post(    "/{deliverable_id}/signoffs",
+        response_model=DeliverableSignoffRead,
+        status_code=status.HTTP_201_CREATED,
+        summary="Create production sign-off for deliverable",
+        description=(
+            "Production sign-off — точка ответственности перед отправкой в QC.\n\n"
+            "QC reject определяет responsible_user_id как `last approved signoff.signed_off_by`.\n"
+            "Используйте sign-off перед `submit_to_qc` (MVP gate требует approved sign-off)."
+            ),
+        )
+def create_signoff(
+    deliverable_id: UUID,
+    body: DeliverableSignoffCreate = Body(..., openapi_examples=SIGNOFF_OPENAPI_EXAMPLES),
+    db: Session = Depends(get_db),
+):
     d = db.get(Deliverable, deliverable_id)
     if not d:
         raise HTTPException(status_code=404, detail="Deliverable not found")
@@ -151,7 +202,15 @@ def create_signoff(deliverable_id: UUID, body: DeliverableSignoffCreate, db: Ses
 
 
 @router.get("/{deliverable_id}/signoffs", response_model=list[DeliverableSignoffRead])
-def list_signoffs(deliverable_id: UUID, org_id: UUID, db: Session = Depends(get_db)):
+def list_signoffs(
+    deliverable_id: UUID,
+    org_id: UUID = Query(
+        ...,
+        description="Организация (мультитенантность). Пока query, позже будет из auth.",
+        examples=["11111111-1111-1111-1111-111111111111"],
+    ),
+    db: Session = Depends(get_db),
+):
     d = db.get(Deliverable, deliverable_id)
     if not d:
         raise HTTPException(status_code=404, detail="Deliverable not found")
@@ -167,8 +226,20 @@ def list_signoffs(deliverable_id: UUID, org_id: UUID, db: Session = Depends(get_
     )
 
 
-@router.post("/{deliverable_id}/submit_to_qc", response_model=DeliverableRead)
-def submit_to_qc(deliverable_id: UUID, body: SubmitToQcRequest, db: Session = Depends(get_db)):
+@router.post("/{deliverable_id}/submit_to_qc",
+    response_model=DeliverableRead,
+    summary="Submit deliverable to QC",
+    description=(
+        "Отправляет изделие в QC: deliverable.status → `submitted_to_qc`.\n\n"
+        "Gate (MVP): требуется последний production sign-off со значением `approved`.\n"
+        "Разрешено только из статусов `open` и `qc_rejected`."
+        ),
+    )
+def submit_to_qc(
+    deliverable_id: UUID,
+    body: SubmitToQcRequest = Body(..., openapi_examples=SUBMIT_TO_QC_OPENAPI_EXAMPLES),
+    db: Session = Depends(get_db),
+):
     d = db.get(Deliverable, deliverable_id)
     if not d:
         raise HTTPException(status_code=404, detail="Deliverable not found")
@@ -200,7 +271,15 @@ def submit_to_qc(deliverable_id: UUID, body: SubmitToQcRequest, db: Session = De
 
 
 @router.get("/{deliverable_id}/qc_inspections", response_model=list[QcInspectionRead])
-def list_qc_inspections(deliverable_id: UUID, org_id: UUID, db: Session = Depends(get_db)):
+def list_qc_inspections(
+    deliverable_id: UUID,
+    org_id: UUID = Query(
+        ...,
+        description="Организация (мультитенантность). Пока query, позже будет из auth.",
+        examples=["11111111-1111-1111-1111-111111111111"],
+    ),
+    db: Session = Depends(get_db),
+):
     d = db.get(Deliverable, deliverable_id)
     if not d:
         raise HTTPException(status_code=404, detail="Deliverable not found")
@@ -215,13 +294,23 @@ def list_qc_inspections(deliverable_id: UUID, org_id: UUID, db: Session = Depend
     )
 
 
-@router.post("/{deliverable_id}/qc_decision", response_model=DeliverableRead)
+@router.post(
+    "/{deliverable_id}/qc_decision",
+    response_model=DeliverableRead,
+    summary="QC decision for deliverable (approve / reject)",
+    description=(
+        "Решение отдела контроля качества по изделию.\n\n"
+        "- `approved`: изделие проходит QC, статус deliverable → `qc_approved`\n"
+        "- `rejected`: изделие отклонено, статус → `qc_rejected`, "
+        "и автоматически создаётся fix-task, привязанный к deliverable.\n\n"
+        "Для `rejected` поле `notes` обязательно и используется как причина отклонения."
+    ),
+)
 def qc_decision(
     deliverable_id: UUID,
     body: QcDecisionRequest = Body(..., openapi_examples=QC_DECISION_OPENAPI_EXAMPLES),
     db: Session = Depends(get_db),
 ):
-
     d = db.get(Deliverable, deliverable_id)
     if not d:
         raise HTTPException(status_code=404, detail="Deliverable not found")
@@ -232,68 +321,95 @@ def qc_decision(
     if d.status != DeliverableStatus.submitted_to_qc.value:
         raise HTTPException(status_code=422, detail=f"QC decision not allowed from status '{d.status}'")
 
-    responsible_user_id = None
-    if body.result == QcResult.rejected:
-        last_approved_signoff = (
-            db.query(DeliverableSignoff)
-            .filter(
-                DeliverableSignoff.deliverable_id == deliverable_id,
-                DeliverableSignoff.result == SignoffResult.approved.value,
+    try:
+        with db.begin():
+            responsible_user_id = None
+
+            if body.result == QcResult.rejected:
+                last_approved_signoff = (
+                    db.query(DeliverableSignoff)
+                    .filter(
+                        DeliverableSignoff.deliverable_id == deliverable_id,
+                        DeliverableSignoff.result == SignoffResult.approved.value,
+                    )
+                    .order_by(DeliverableSignoff.created_at.desc())
+                    .first()
+                )
+
+                # Invariant: submit_to_qc requires approved signoff,
+                # so QC reject must be able to resolve responsible_user_id.
+                if not last_approved_signoff:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Invariant violated: no approved signoff found for QC reject",
+                    )
+
+                responsible_user_id = last_approved_signoff.signed_off_by
+
+            qc = QcInspection(
+                org_id=body.org_id,
+                project_id=body.project_id,
+                deliverable_id=deliverable_id,
+                inspector_user_id=body.inspector_user_id,
+                responsible_user_id=responsible_user_id,
+                result=body.result.value if hasattr(body.result, "value") else str(body.result),
+                notes=body.notes,
             )
-            .order_by(DeliverableSignoff.created_at.desc())
-            .first()
-        )
-        if last_approved_signoff:
-            responsible_user_id = last_approved_signoff.signed_off_by
+            db.add(qc)
 
+            if body.result == QcResult.approved:
+                d.status = DeliverableStatus.qc_approved.value
+            else:
+                d.status = DeliverableStatus.qc_rejected.value
 
-    # записываем факт инспекции
-    qc = QcInspection(
-        org_id=body.org_id,
-        project_id=body.project_id,
-        deliverable_id=deliverable_id,
-        inspector_user_id=body.inspector_user_id,
-        responsible_user_id=responsible_user_id,
-        result=body.result.value if hasattr(body.result, "value") else str(body.result),
-        notes=body.notes,
-    )
-    db.add(qc)
+                fix_title = f"Исправление (QC): {d.deliverable_type} {d.serial}"
+                fix_title = fix_title[:250]
 
-    if body.result == QcResult.approved:
-        d.status = DeliverableStatus.qc_approved.value
-    else:
-        d.status = DeliverableStatus.qc_rejected.value
+                fix_task = Task(
+                    org_id=d.org_id,
+                    project_id=d.project_id,
+                    created_by=body.inspector_user_id,
+                    title=fix_title,
+                    description=body.notes,
+                    priority=0,
+                    status=TaskStatus.new.value,
+                    kind=TaskKind.production.value,
+                    other_kind_label=None,
+                    deliverable_id=d.id,
+                    parent_task_id=None,
+                    fix_reason="QC rejected",
 
-        # создаём "исправление (QC)" task, привязанный к этому изделию
-        fix_title = f"Исправление (QC): {d.deliverable_type} {d.serial}"
-        if body.notes:
-            # чтобы заголовок не разрастался
-            fix_title = fix_title[:250]
+                    # IMPORTANT: fix-task classification
+                    work_kind=WorkKind.fix,
+                    fix_source=FixSource.qc_reject,
+                    fix_severity=FixSeverity.major,
+                )
+                db.add(fix_task)
+                db.flush()  # гарантируем, что fix_task.id появился
 
-        fix_task = Task(
-            org_id=d.org_id,
-            project_id=d.project_id,
-            created_by=body.inspector_user_id,  # в MVP: кто создал — QC инспектор
-            title=fix_title,
-            description=body.notes,
-            priority=0,
-            status=TaskStatus.new.value,
-            kind=TaskKind.production.value,
-            other_kind_label=None,
-            deliverable_id=d.id,
-            parent_task_id=None,   # тут можно потом связать с исходной task, если понадобится
-            fix_reason="QC rejected",
-        )
-        db.add(fix_task)
+                if fix_task.id is None:
+                    raise HTTPException(status_code=409, detail="Invariant violated: fix-task was not created")
 
-    db.add(d)
-    db.commit()
-    db.refresh(d)
-    return d
+            db.add(d)
+
+        db.refresh(d)
+        return d
+
+    except BootstrapError as e:
+        # (на всякий) если BootstrapError импортирован и тут не нужен — убери этот except
+        raise HTTPException(status_code=422, detail=str(e))
 
 
 @router.get("/{deliverable_id}/tasks", response_model=list[TaskRead])
-def list_deliverable_tasks(deliverable_id: UUID, org_id: UUID, db: Session = Depends(get_db)):
+def list_deliverable_tasks(
+    deliverable_id: UUID,
+    org_id: UUID = Query(
+        ...,
+        description="Организация (мультитенантность). Пока query, позже будет из auth.",
+        examples=["11111111-1111-1111-1111-111111111111"],
+    ),
+    db: Session = Depends(get_db),
+):
     d = db.get(Deliverable, deliverable_id)
     if not d:
         raise HTTPException(status_code=404, detail="Deliverable not found")
@@ -309,7 +425,15 @@ def list_deliverable_tasks(deliverable_id: UUID, org_id: UUID, db: Session = Dep
 
 
 @router.get("/{deliverable_id}/dashboard", response_model=DeliverableDashboard)
-def get_dashboard(deliverable_id: UUID, org_id: UUID, db: Session = Depends(get_db)):
+def get_dashboard(
+    deliverable_id: UUID,
+    org_id: UUID = Query(
+        ...,
+        description="Организация (мультитенантность). Пока query, позже будет из auth.",
+        examples=["11111111-1111-1111-1111-111111111111"],
+    ),
+    db: Session = Depends(get_db),
+):
     d = db.get(Deliverable, deliverable_id)
     if not d:
         raise HTTPException(status_code=404, detail="Deliverable not found")
@@ -347,9 +471,16 @@ def get_dashboard(deliverable_id: UUID, org_id: UUID, db: Session = Depends(get_
 @router.post("/{deliverable_id}/bootstrap", response_model=DeliverableBootstrapResponse)
 def bootstrap_deliverable(
     deliverable_id: UUID,
-    org_id: UUID,
-    project_id: UUID,
-    actor_user_id: UUID,
+    org_id: UUID = Query(
+            ...,
+            description="Организация (мультитенантность). Пока query, позже будет из auth.",
+            examples=["11111111-1111-1111-1111-111111111111"],
+        ),
+    project_id: UUID = Query(
+            ...,
+            description="Проект. Пока query, позже будет из auth/context.",
+            examples=["22222222-2222-2222-2222-222222222222"],
+        ),
     db: Session = Depends(get_db),
 ):
     service = DeliverableBootstrapService(db)
@@ -360,7 +491,6 @@ def bootstrap_deliverable(
                 org_id=org_id,
                 project_id=project_id,
                 deliverable_id=deliverable_id,
-                actor_user_id=actor_user_id,
             )
     except BootstrapError as e:
         raise HTTPException(status_code=422, detail=str(e))
@@ -369,7 +499,7 @@ def bootstrap_deliverable(
         template_version_id=result.template_version_id,
         created_tasks=result.created_tasks,
         created_dependencies=result.created_dependencies,
-    )
+        )
 
 
 @router.post("/{deliverable_id}/fix-tasks", response_model=TaskRead)

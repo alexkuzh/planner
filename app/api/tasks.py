@@ -1,10 +1,12 @@
 # app/api/tasks.py
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Body
+
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 from uuid import UUID
 
+from app.services.task_fix_service import TaskFixService
 from app.services.task_transition_service import apply_task_transition, VersionConflict
 from app.core.db import get_db
 
@@ -13,6 +15,8 @@ from app.fsm.task_fsm import TransitionNotAllowed, apply_transition
 from app.schemas.task import TaskCreate, TaskRead, TaskUpdate, TaskBlockerRead, TaskDependencyCreate, TaskDependencyRead
 from app.schemas.task_event import TaskEventRead
 from app.schemas.transition import TaskTransitionRequest, TaskTransitionResponse, TaskTransitionItem
+from app.schemas.command import Command
+from app.schemas.fix_task import ReportFixPayload
 
 from app.models.task import Task, TaskStatus
 from app.models.task_event import TaskEvent
@@ -20,9 +24,9 @@ from app.models.task_transition import TaskTransition
 from app.models.deliverable import Deliverable
 
 
-router = APIRouter()
+router = APIRouter(prefix="/tasks")
 
-@router.post("/tasks", response_model=TaskRead, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=TaskRead, status_code=status.HTTP_201_CREATED)
 def create_task(data: TaskCreate, db: Session = Depends(get_db)):
     if data.deliverable_id is not None:
         d = db.get(Deliverable, data.deliverable_id)
@@ -51,9 +55,113 @@ def create_task(data: TaskCreate, db: Session = Depends(get_db)):
     db.refresh(task)
     return task
 
+TASK_TRANSITION_OPENAPI_EXAMPLES = {
+    "plan": {
+        "summary": "Plan task",
+        "description": "Перевести задачу в planned (обычно системное/лидское действие).",
+        "value": {
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "actor_user_id": "33333333-3333-3333-3333-333333333333",
+            "action": "plan",
+            "expected_row_version": 1,
+            "client_event_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "payload": {},
+        },
+    },
+    "assign": {
+        "summary": "Assign task",
+        "description": "Назначить исполнителя.",
+        "value": {
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "actor_user_id": "33333333-3333-3333-3333-333333333333",
+            "action": "assign",
+            "expected_row_version": 2,
+            "client_event_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "payload": {"assign_to": "33333333-3333-3333-3333-333333333333"},
+        },
+    },
+    "start": {
+        "summary": "Start task",
+        "description": "Взять задачу в работу.",
+        "value": {
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "actor_user_id": "33333333-3333-3333-3333-333333333333",
+            "action": "start",
+            "expected_row_version": 3,
+            "client_event_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "payload": {},
+        },
+    },
+    "submit": {
+        "summary": "Submit task",
+        "description": "Отправить на ревью/проверку.",
+        "value": {
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "actor_user_id": "33333333-3333-3333-3333-333333333333",
+            "action": "submit",
+            "expected_row_version": 4,
+            "client_event_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+            "payload": {},
+        },
+    },
+    "approve": {
+        "summary": "Approve task",
+        "description": "Подтвердить (ревьюер/лид).",
+        "value": {
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "actor_user_id": "33333333-3333-3333-3333-333333333333",
+            "action": "approve",
+            "expected_row_version": 5,
+            "client_event_id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+            "payload": {},
+        },
+    },
+    "reject": {
+        "summary": "Reject task",
+        "description": "Отклонить и (опционально) создать fix-task.",
+        "value": {
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "actor_user_id": "33333333-3333-3333-3333-333333333333",
+            "action": "reject",
+            "expected_row_version": 6,
+            "client_event_id": "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+            "payload": {
+                "reason": "Найдены дефекты, требуется доработка",
+                "fix_title": "Исправить дефекты по задаче",
+                "assign_to": "33333333-3333-3333-3333-333333333333",
+            },
+        },
+    },
+}
 
-@router.post("/{task_id}/transitions", response_model=TaskTransitionResponse)
-def transition_task(task_id: UUID, payload: TaskTransitionRequest, db: Session = Depends(get_db)):
+REPORT_FIX_OPENAPI_EXAMPLES = {
+    "worker_initiative_fix": {
+        "summary": "Report fix (worker initiative)",
+        "description": "Работник заметил косяк и исправил — фиксируем время и серьёзность.",
+        "value": {
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "actor_user_id": "33333333-3333-3333-3333-333333333333",
+            "expected_row_version": 1,
+            "client_event_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "payload": {
+                "title": "Исправил косяк по месту",
+                "description": "Нашёл дефект на соседнем этапе и устранил.",
+                "severity": "minor",
+                "minutes_spent": 15,
+                "attachments": []
+            }
+        },
+    }
+}
+
+
+@router.post("/{task_id}/transitions", response_model=TaskTransitionResponse,
+                                            response_model_exclude_none=True,)
+def transition_task(
+    task_id: UUID,
+    payload: TaskTransitionRequest = Body(..., openapi_examples=TASK_TRANSITION_OPENAPI_EXAMPLES),
+    db: Session = Depends(get_db),
+):
     try:
         with db.begin():
             task, fix_task = apply_task_transition(
@@ -82,7 +190,7 @@ def transition_task(task_id: UUID, payload: TaskTransitionRequest, db: Session =
         raise HTTPException(status_code=404, detail="Task not found")
 
 
-@router.post("/tasks/{task_id}/dependencies", status_code=201)
+@router.post("/{task_id}/dependencies", status_code=201)
 def add_dependency(task_id: UUID, org_id: UUID, created_by: UUID, body: TaskDependencyCreate, db: Session = Depends(get_db)):
     """
     Создаёт зависимость predecessor -> successor(task_id).
@@ -119,7 +227,7 @@ def add_dependency(task_id: UUID, org_id: UUID, created_by: UUID, body: TaskDepe
     return {"ok": True}
 
 
-@router.get("/tasks", response_model=list[TaskRead])
+@router.get("", response_model=list[TaskRead])
 def list_tasks(db: Session = Depends(get_db)):
     return (
         db.query(Task)
@@ -128,7 +236,7 @@ def list_tasks(db: Session = Depends(get_db)):
     )
 
 
-@router.get("/tasks/{task_id}/transitions", response_model=list[TaskTransitionItem])
+@router.get("/{task_id}/transitions", response_model=list[TaskTransitionItem])
 def list_task_transitions(task_id: UUID, org_id: UUID, db: Session = Depends(get_db)):
     """
     Timeline переходов FSM по задаче.
@@ -147,7 +255,7 @@ def list_task_transitions(task_id: UUID, org_id: UUID, db: Session = Depends(get
     )
     return transitions
 
-@router.get("/tasks/{task_id}/dependencies", response_model=list[TaskDependencyRead])
+@router.get("/{task_id}/dependencies", response_model=list[TaskDependencyRead])
 def list_dependencies(task_id: UUID, org_id: UUID, db: Session = Depends(get_db)):
     rows = db.execute(
         text("""
@@ -162,7 +270,7 @@ def list_dependencies(task_id: UUID, org_id: UUID, db: Session = Depends(get_db)
     return list(rows)
 
 
-@router.get("/tasks/{task_id}/blockers", response_model=list[TaskBlockerRead])
+@router.get("/{task_id}/blockers", response_model=list[TaskBlockerRead])
 def list_task_blockers(task_id: UUID, org_id: UUID, db: Session = Depends(get_db)):
     # проверка существования задачи в org
     task = db.execute(
@@ -243,7 +351,7 @@ def delete_task(task_id: UUID, db: Session = Depends(get_db)):
     return None
 
 
-@router.delete("/tasks/{task_id}/dependencies/{predecessor_id}", status_code=204)
+@router.delete("/{task_id}/dependencies/{predecessor_id}", status_code=204)
 def delete_dependency(task_id: UUID, predecessor_id: UUID, org_id: UUID, db: Session = Depends(get_db)):
     res = db.execute(
         text("""
@@ -256,3 +364,29 @@ def delete_dependency(task_id: UUID, predecessor_id: UUID, org_id: UUID, db: Ses
     )
     db.commit()
     return None
+
+@router.post("/{task_id}/report-fix", response_model=TaskRead)
+def report_fix(
+    task_id: UUID,
+    cmd: Command[ReportFixPayload] = Body(..., openapi_examples=REPORT_FIX_OPENAPI_EXAMPLES),
+    db: Session = Depends(get_db),
+):
+    origin = db.get(Task, task_id)
+    if not origin:
+        raise HTTPException(404, "Task not found")
+    if origin.deliverable_id is None:
+        raise HTTPException(422, "Origin task must be linked to a deliverable for report-fix (use deliverable fix endpoint).")
+
+    svc = TaskFixService(db)
+    fix = svc.create_initiative_fix_for_task(
+        origin_task=origin,
+        actor_user_id=cmd.actor_user_id,
+        title=cmd.payload.title,
+        description=cmd.payload.description,
+        severity=cmd.payload.severity,
+        minutes_spent=cmd.payload.minutes_spent,
+        attachments=[a.model_dump() for a in cmd.payload.attachments],
+    )
+    db.commit()
+    db.refresh(fix)
+    return fix

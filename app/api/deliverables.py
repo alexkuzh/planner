@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Body
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from uuid import UUID
@@ -10,7 +10,7 @@ from app.core.db import get_db
 from app.models.deliverable import Deliverable, DeliverableStatus
 from app.models.deliverable_signoff import DeliverableSignoff,SignoffResult
 from app.models.qc_inspection import QcInspection, QcResult
-from app.models.task import Task, TaskStatus, TaskKind
+from app.models.task import Task, TaskStatus, TaskKind, FixSource
 
 from app.schemas.deliverable import DeliverableCreate, DeliverableRead
 from app.schemas.deliverable_signoff import DeliverableSignoffCreate, DeliverableSignoffRead
@@ -18,9 +18,69 @@ from app.schemas.deliverable_actions import SubmitToQcRequest
 from app.schemas.deliverable_dashboard import DeliverableDashboard
 from app.schemas.qc_inspection import QcDecisionRequest, QcInspectionRead
 from app.schemas.task import TaskRead
+from app.schemas.command import Command
+from app.schemas.fix_task import DeliverableFixPayload
 
+from app.services.deliverable_bootstrap_service import (
+    DeliverableBootstrapService,
+    BootstrapError,
+)
+from pydantic import BaseModel
 
 router = APIRouter(prefix="/deliverables", tags=["deliverables"])
+
+DELIVERABLE_FIX_OPENAPI_EXAMPLES = {
+    "worker_initiative": {
+        "summary": "Create deliverable fix-task (worker initiative)",
+        "description": "Исправление по инициативе работника на уровне deliverable (без origin_task).",
+        "value": {
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "actor_user_id": "33333333-3333-3333-3333-333333333333",
+            "expected_row_version": 1,
+            "client_event_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "payload": {
+                "title": "Инициативный фикс",
+                "description": "Нашел косяк по месту — исправил.",
+                "severity": "minor",
+                "minutes_spent": 15,
+                "attachments": []
+            }
+        },
+    }
+}
+
+QC_DECISION_OPENAPI_EXAMPLES = {
+    "approve": {
+        "summary": "QC approve deliverable",
+        "description": "QC подтверждает изделие. notes опционально.",
+        "value": {
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "project_id": "22222222-2222-2222-2222-222222222222",
+            "inspector_user_id": "33333333-3333-3333-3333-333333333333",
+            "result": "approved",
+            "notes": "OK",
+        },
+    },
+    "reject": {
+        "summary": "QC reject deliverable",
+        "description": "QC отклоняет изделие. notes обязательно (причина/замечания).",
+        "value": {
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "project_id": "22222222-2222-2222-2222-222222222222",
+            "inspector_user_id": "33333333-3333-3333-3333-333333333333",
+            "result": "rejected",
+            "notes": "Царапина на корпусе, требуется исправление",
+        },
+    },
+}
+
+
+class DeliverableBootstrapResponse(BaseModel):
+    template_version_id: UUID
+    created_tasks: int
+    created_dependencies: int
+
+
 
 
 @router.post("", response_model=DeliverableRead, status_code=status.HTTP_201_CREATED)
@@ -156,7 +216,12 @@ def list_qc_inspections(deliverable_id: UUID, org_id: UUID, db: Session = Depend
 
 
 @router.post("/{deliverable_id}/qc_decision", response_model=DeliverableRead)
-def qc_decision(deliverable_id: UUID, body: QcDecisionRequest, db: Session = Depends(get_db)):
+def qc_decision(
+    deliverable_id: UUID,
+    body: QcDecisionRequest = Body(..., openapi_examples=QC_DECISION_OPENAPI_EXAMPLES),
+    db: Session = Depends(get_db),
+):
+
     d = db.get(Deliverable, deliverable_id)
     if not d:
         raise HTTPException(status_code=404, detail="Deliverable not found")
@@ -278,3 +343,57 @@ def get_dashboard(deliverable_id: UUID, org_id: UUID, db: Session = Depends(get_
         last_signoff=last_signoff,
         last_qc_inspection=last_qc,
     )
+
+@router.post("/{deliverable_id}/bootstrap", response_model=DeliverableBootstrapResponse)
+def bootstrap_deliverable(
+    deliverable_id: UUID,
+    org_id: UUID,
+    project_id: UUID,
+    actor_user_id: UUID,
+    db: Session = Depends(get_db),
+):
+    service = DeliverableBootstrapService(db)
+
+    try:
+        with db.begin():
+            result = service.bootstrap(
+                org_id=org_id,
+                project_id=project_id,
+                deliverable_id=deliverable_id,
+                actor_user_id=actor_user_id,
+            )
+    except BootstrapError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    return DeliverableBootstrapResponse(
+        template_version_id=result.template_version_id,
+        created_tasks=result.created_tasks,
+        created_dependencies=result.created_dependencies,
+    )
+
+
+@router.post("/{deliverable_id}/fix-tasks", response_model=TaskRead)
+def create_deliverable_fix(
+    deliverable_id: UUID,
+    cmd: Command[DeliverableFixPayload] = Body(..., openapi_examples=DELIVERABLE_FIX_OPENAPI_EXAMPLES),
+    db: Session = Depends(get_db),
+):
+    deliverable = db.get(Deliverable, deliverable_id)
+    if not deliverable:
+        raise HTTPException(404, "Deliverable not found")
+
+    fix = Task(
+        org_id=cmd.org_id,
+        deliverable_id=deliverable_id,
+        title=cmd.payload.title,
+        description=cmd.payload.description,
+        kind=TaskKind.fix,
+        fix_source=FixSource.worker_initiative,
+        fix_severity=cmd.payload.severity,
+        minutes_spent=cmd.payload.minutes_spent,
+        created_by=cmd.actor_user_id,
+    )
+    db.add(fix)
+    db.commit()
+    db.refresh(fix)
+    return fix

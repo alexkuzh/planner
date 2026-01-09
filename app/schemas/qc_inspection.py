@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.models.qc_inspection import QcResult
 
@@ -14,6 +14,12 @@ class QcDecisionRequest(BaseModel):
     result: QcResult
     notes: str | None = Field(default=None, max_length=2000)
 
+    @model_validator(mode="after")
+    def _reject_requires_notes(self):
+        if self.result == QcResult.rejected and (self.notes is None or not self.notes.strip()):
+            raise ValueError("notes is required when result='rejected'")
+        return self
+    
 
 class QcInspectionRead(BaseModel):
     id: UUID

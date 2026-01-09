@@ -1,0 +1,13 @@
+# app/schemas/command.py
+from typing import Generic, TypeVar
+from pydantic import BaseModel
+from uuid import UUID
+
+T = TypeVar("T")
+
+class Command(BaseModel, Generic[T]):
+    org_id: UUID
+    actor_user_id: UUID
+    expected_row_version: int
+    client_event_id: UUID
+    payload: T

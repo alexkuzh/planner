@@ -36,6 +36,12 @@ class Deliverable(Base):
     org_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
     project_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
 
+    # по какой версии "чертежа/DNA" развернули задачи для этого изделия
+    template_version_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        nullable=True,
+    )
+
     # тип изделия (chair/table/...), пока строкой
     deliverable_type: Mapped[str] = mapped_column(String, nullable=False)
 

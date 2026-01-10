@@ -11,7 +11,7 @@ from app.models.project_template import ProjectTemplate
 from app.models.project_template_version import ProjectTemplateVersion
 from app.models.project_template_node import ProjectTemplateNode
 from app.models.project_template_edge import ProjectTemplateEdge
-from app.models.task import Task, TaskStatus
+from app.models.task import Task, TaskStatus, WorkKind
 
 
 class BootstrapError(ValueError):
@@ -112,6 +112,7 @@ class DeliverableBootstrapService:
                 priority=n.priority,
                 status=TaskStatus.planned.value,  # важно: не in_progress автоматически
                 kind=n.kind,
+                work_kind=WorkKind.work,  # ⬅️ страховка: bootstrap всегда создаёт обычные work-задачи
                 other_kind_label=None,
                 deliverable_id=deliverable_id,
                 is_milestone=bool(n.is_milestone),

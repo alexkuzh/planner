@@ -4,11 +4,14 @@ from fastapi import APIRouter, Depends, HTTPException, status, Body, Query
 
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
+
 from uuid import UUID
 
 from app.services.task_fix_service import TaskFixService
 from app.services.task_transition_service import apply_task_transition, VersionConflict
+
 from app.core.db import get_db
+from app.core.rbac import ensure_allowed, Forbidden
 
 from app.fsm.task_fsm import TransitionNotAllowed, apply_transition
 
@@ -18,13 +21,15 @@ from app.schemas.transition import TaskTransitionRequest, TaskTransitionResponse
 from app.schemas.command import Command
 from app.schemas.fix_task import ReportFixPayload
 
-from app.models.task import Task, TaskStatus
+from app.models.task import Task, TaskStatus, WorkKind
 from app.models.task_event import TaskEvent
 from app.models.task_transition import TaskTransition
 from app.models.deliverable import Deliverable
 
+from app.api.deps import get_actor_role
 
-router = APIRouter(prefix="/tasks")
+
+router = APIRouter(prefix="/tasks", tags=["tasks"])
 
 
 TASK_TRANSITION_OPENAPI_EXAMPLES = {
@@ -145,6 +150,7 @@ def create_task(data: TaskCreate, db: Session = Depends(get_db)):
         status=TaskStatus.new.value,  # или просто "new"
 
         kind=data.kind.value if hasattr(data.kind, "value") else str(data.kind),
+        work_kind=WorkKind.work,  # ⬅️ СТРАХОВКА
         other_kind_label=data.other_kind_label,
 
         deliverable_id=data.deliverable_id,
@@ -169,8 +175,15 @@ def create_task(data: TaskCreate, db: Session = Depends(get_db)):
 def transition_task(
     task_id: UUID,
     payload: TaskTransitionRequest = Body(..., openapi_examples=TASK_TRANSITION_OPENAPI_EXAMPLES),
+    actor_role: str = Depends(get_actor_role),
     db: Session = Depends(get_db),
 ):
+    # RBAC: разрешение зависит от action
+    try:
+        ensure_allowed(f"task.{payload.action}", actor_role)
+    except Forbidden as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
     try:
         with db.begin():
             task, fix_task = apply_task_transition(

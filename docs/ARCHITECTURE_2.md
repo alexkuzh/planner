@@ -207,6 +207,56 @@ Planner — это backend-система для управления произ
 
 ---
 
+## RBAC (MVP)
+
+### Transport (временно)
+На MVP роль передаётся в HTTP header:
+
+- `X-Role: <role>`
+
+Система внутренняя, поэтому API по умолчанию “all-locked”:
+без `X-Role` любой endpoint (кроме `/docs`, `/openapi.json`, `/redoc`) возвращает `401`.
+
+Дальше это будет заменено на JWT/Auth, но permission names останутся теми же.
+
+### Roles (MVP)
+- `system`
+- `project_creator`
+- `receiver`
+- `internal_controller`
+- `qc`
+- `supervisor`
+- `lead`
+- `responsible`
+- `executor`
+- `qualified_worker`
+
+### Permissions map
+| Permission | Allowed roles |
+|---|---|
+| `deliverable.create` | `project_creator`, `receiver` |
+| `deliverable.bootstrap` | `system` |
+| `deliverable.submit_to_qc` | `internal_controller` |
+| `deliverable.qc_decision` | `qc` |
+| `deliverable.signoff` | `lead`, `responsible` |
+| `task.plan` | `system`, `lead` |
+| `task.assign` | `lead`, `supervisor` |
+| `task.unassign` | `lead`, `supervisor` |
+| `task.start` | `executor`, `lead` |
+| `task.submit` | `executor`, `lead` |
+| `task.approve` | `lead`, `supervisor` |
+| `task.reject` | `lead`, `supervisor` |
+| `fix.worker_initiative` | `qualified_worker`, `executor`, `lead`, `supervisor` |
+| `fix.qc_reject` | `qc` |
+
+### Curl example
+```bash
+curl -H "X-Role: lead" -H "Content-Type: application/json" \
+  -X POST "http://127.0.0.1:8000/<endpoint>" \
+  -d '{ ... }'
+
+
+
 ## 7. Отложено сознательно
 
 * **M5:** QC по milestone (`milestone_task_id` в qc_inspections)

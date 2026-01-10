@@ -1,3 +1,5 @@
+# app/api/deliverables.py
+
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, status, Body, Query
@@ -5,27 +7,30 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from uuid import UUID
 
+from pydantic import BaseModel
+
 from app.core.db import get_db
 
 from app.models.deliverable import Deliverable, DeliverableStatus
-from app.models.deliverable_signoff import DeliverableSignoff,SignoffResult
+from app.models.deliverable_signoff import DeliverableSignoff, SignoffResult
 from app.models.qc_inspection import QcInspection, QcResult
-from app.models.task import Task, TaskStatus, TaskKind, FixSource, WorkKind, FixSource, FixSeverity
+from app.models.task import Task, FixSeverity
+
+from app.api.deps import get_actor_role
+from app.core.rbac import ensure_allowed, Forbidden
 
 from app.schemas.deliverable import DeliverableCreate, DeliverableRead
 from app.schemas.deliverable_signoff import DeliverableSignoffCreate, DeliverableSignoffRead
-from app.schemas.deliverable_actions import SubmitToQcRequest
+from app.schemas.deliverable_actions import SubmitToQcRequest, DeliverableBootstrapRequest
 from app.schemas.deliverable_dashboard import DeliverableDashboard
 from app.schemas.qc_inspection import QcDecisionRequest, QcInspectionRead
 from app.schemas.task import TaskRead
 from app.schemas.command import Command
 from app.schemas.fix_task import DeliverableFixPayload
 
-from app.services.deliverable_bootstrap_service import (
-    DeliverableBootstrapService,
-    BootstrapError,
-)
-from pydantic import BaseModel
+from app.services.task_fix_service import TaskFixService
+from app.services.deliverable_bootstrap_service import DeliverableBootstrapService, BootstrapError
+
 
 router = APIRouter(prefix="/deliverables", tags=["deliverables"])
 
@@ -111,7 +116,30 @@ SIGNOFF_OPENAPI_EXAMPLES = {
     },
 }
 
+DELIVERABLE_CREATE_OPENAPI_EXAMPLES = {
+    "basic": {
+        "summary": "Create deliverable",
+        "description": "Создать изделие (serial приходит извне).",
+        "value": {
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "project_id": "22222222-2222-2222-2222-222222222222",
+            "created_by": "33333333-3333-3333-3333-333333333333",
+            "deliverable_type": "box_v1",
+            "serial": "SN-2026-0001",
+        },
+    },
+}
 
+DELIVERABLE_BOOTSTRAP_OPENAPI_EXAMPLES = {
+    "basic": {
+        "summary": "Bootstrap deliverable",
+        "description": "Развернуть дерево задач по активной версии шаблона проекта.",
+        "value": {
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "project_id": "22222222-2222-2222-2222-222222222222",
+        },
+    }
+}
 
 class DeliverableBootstrapResponse(BaseModel):
     template_version_id: UUID
@@ -119,10 +147,11 @@ class DeliverableBootstrapResponse(BaseModel):
     created_dependencies: int
 
 
-
-
 @router.post("", response_model=DeliverableRead, status_code=status.HTTP_201_CREATED)
-def create_deliverable(data: DeliverableCreate, db: Session = Depends(get_db)):
+def create_deliverable(
+        data: DeliverableCreate = Body(..., openapi_examples=DELIVERABLE_CREATE_OPENAPI_EXAMPLES),
+        db: Session = Depends(get_db),
+    ):
     # Проверим уникальность serial в org (чтобы вернуть 409, а не 500)
     existing = db.execute(
         select(Deliverable).where(
@@ -178,8 +207,15 @@ def list_deliverables(org_id: UUID, project_id: UUID, db: Session = Depends(get_
 def create_signoff(
     deliverable_id: UUID,
     body: DeliverableSignoffCreate = Body(..., openapi_examples=SIGNOFF_OPENAPI_EXAMPLES),
+    actor_role: str = Depends(get_actor_role),
     db: Session = Depends(get_db),
 ):
+    # RBAC
+    try:
+        ensure_allowed("deliverable.signoff", actor_role)
+    except Forbidden as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
     d = db.get(Deliverable, deliverable_id)
     if not d:
         raise HTTPException(status_code=404, detail="Deliverable not found")
@@ -238,8 +274,15 @@ def list_signoffs(
 def submit_to_qc(
     deliverable_id: UUID,
     body: SubmitToQcRequest = Body(..., openapi_examples=SUBMIT_TO_QC_OPENAPI_EXAMPLES),
+    actor_role: str = Depends(get_actor_role),
     db: Session = Depends(get_db),
 ):
+    # RBAC
+    try:
+        ensure_allowed("deliverable.submit_to_qc", actor_role)
+    except Forbidden as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
     d = db.get(Deliverable, deliverable_id)
     if not d:
         raise HTTPException(status_code=404, detail="Deliverable not found")
@@ -262,6 +305,8 @@ def submit_to_qc(
 
     if last_signoff.result != SignoffResult.approved.value:
         raise HTTPException(status_code=422, detail="Last production sign-off is not approved")
+
+    _ = body.actor_user_id  # TODO: писать audit event submit_to_qc
 
     d.status = DeliverableStatus.submitted_to_qc.value
     db.add(d)
@@ -309,8 +354,15 @@ def list_qc_inspections(
 def qc_decision(
     deliverable_id: UUID,
     body: QcDecisionRequest = Body(..., openapi_examples=QC_DECISION_OPENAPI_EXAMPLES),
+    actor_role: str = Depends(get_actor_role),
     db: Session = Depends(get_db),
 ):
+    # RBAC
+    try:
+        ensure_allowed("deliverable.qc_decision", actor_role)
+    except Forbidden as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
     d = db.get(Deliverable, deliverable_id)
     if not d:
         raise HTTPException(status_code=404, detail="Deliverable not found")
@@ -321,84 +373,58 @@ def qc_decision(
     if d.status != DeliverableStatus.submitted_to_qc.value:
         raise HTTPException(status_code=422, detail=f"QC decision not allowed from status '{d.status}'")
 
-    try:
-        with db.begin():
-            responsible_user_id = None
-
-            if body.result == QcResult.rejected:
-                last_approved_signoff = (
-                    db.query(DeliverableSignoff)
-                    .filter(
-                        DeliverableSignoff.deliverable_id == deliverable_id,
-                        DeliverableSignoff.result == SignoffResult.approved.value,
-                    )
-                    .order_by(DeliverableSignoff.created_at.desc())
-                    .first()
-                )
-
-                # Invariant: submit_to_qc requires approved signoff,
-                # so QC reject must be able to resolve responsible_user_id.
-                if not last_approved_signoff:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Invariant violated: no approved signoff found for QC reject",
-                    )
-
-                responsible_user_id = last_approved_signoff.signed_off_by
-
-            qc = QcInspection(
-                org_id=body.org_id,
-                project_id=body.project_id,
-                deliverable_id=deliverable_id,
-                inspector_user_id=body.inspector_user_id,
-                responsible_user_id=responsible_user_id,
-                result=body.result.value if hasattr(body.result, "value") else str(body.result),
-                notes=body.notes,
+    responsible_user_id = None
+    if body.result == QcResult.rejected:
+        last_approved_signoff = (
+            db.query(DeliverableSignoff)
+            .filter(
+                DeliverableSignoff.deliverable_id == deliverable_id,
+                DeliverableSignoff.result == SignoffResult.approved.value,
             )
-            db.add(qc)
+            .order_by(DeliverableSignoff.created_at.desc())
+            .first()
+        )
+        if last_approved_signoff:
+            responsible_user_id = last_approved_signoff.signed_off_by
 
-            if body.result == QcResult.approved:
-                d.status = DeliverableStatus.qc_approved.value
-            else:
-                d.status = DeliverableStatus.qc_rejected.value
+    qc = QcInspection(
+        org_id=body.org_id,
+        project_id=body.project_id,
+        deliverable_id=deliverable_id,
+        inspector_user_id=body.inspector_user_id,
+        responsible_user_id=responsible_user_id,
+        result=body.result.value if hasattr(body.result, "value") else str(body.result),
+        notes=body.notes,
+    )
+    db.add(qc)
 
-                fix_title = f"Исправление (QC): {d.deliverable_type} {d.serial}"
-                fix_title = fix_title[:250]
+    if body.result == QcResult.approved:
+        d.status = DeliverableStatus.qc_approved.value
+    else:
+        d.status = DeliverableStatus.qc_rejected.value
+        # (создание fix-task у тебя тут уже есть — оставляем как есть или позже переведём на TaskFixService)
+        # гарантируем qc.id (если id генерится python-ом — flush не обязателен, но безопасен)
+        db.flush()
 
-                fix_task = Task(
-                    org_id=d.org_id,
-                    project_id=d.project_id,
-                    created_by=body.inspector_user_id,
-                    title=fix_title,
-                    description=body.notes,
-                    priority=0,
-                    status=TaskStatus.new.value,
-                    kind=TaskKind.production.value,
-                    other_kind_label=None,
-                    deliverable_id=d.id,
-                    parent_task_id=None,
-                    fix_reason="QC rejected",
+        svc = TaskFixService(db)
 
-                    # IMPORTANT: fix-task classification
-                    work_kind=WorkKind.fix,
-                    fix_source=FixSource.qc_reject,
-                    fix_severity=FixSeverity.major,
-                )
-                db.add(fix_task)
-                db.flush()  # гарантируем, что fix_task.id появился
+        fix_title = f"Исправление (QC): {d.deliverable_type} {d.serial}"
+        fix_title = fix_title[:250]  # чтобы не разрастался
 
-                if fix_task.id is None:
-                    raise HTTPException(status_code=409, detail="Invariant violated: fix-task was not created")
+        svc.create_qc_reject_fix(
+            deliverable=d,
+            actor_user_id=body.inspector_user_id,
+            qc_inspection_id=qc.id,
+            title=fix_title,
+            description=body.notes,
+            severity=FixSeverity.major,
+        )
 
-            db.add(d)
 
-        db.refresh(d)
-        return d
-
-    except BootstrapError as e:
-        # (на всякий) если BootstrapError импортирован и тут не нужен — убери этот except
-        raise HTTPException(status_code=422, detail=str(e))
-
+    db.add(d)
+    db.commit()
+    db.refresh(d)
+    return d
 
 @router.get("/{deliverable_id}/tasks", response_model=list[TaskRead])
 def list_deliverable_tasks(
@@ -468,28 +494,35 @@ def get_dashboard(
         last_qc_inspection=last_qc,
     )
 
-@router.post("/{deliverable_id}/bootstrap", response_model=DeliverableBootstrapResponse)
+@router.post(
+    "/{deliverable_id}/bootstrap",
+    response_model=DeliverableBootstrapResponse,
+    summary="Bootstrap tasks for deliverable",
+    description=(
+        "Создаёт задачи и зависимости по активной версии шаблона проекта и привязывает их к deliverable.\n\n"
+        "Операция тяжёлая и не должна вызываться повторно для одного deliverable без явного reset/rollback.\n"
+        "Доступ ограничен RBAC."
+    ),
+)
 def bootstrap_deliverable(
     deliverable_id: UUID,
-    org_id: UUID = Query(
-            ...,
-            description="Организация (мультитенантность). Пока query, позже будет из auth.",
-            examples=["11111111-1111-1111-1111-111111111111"],
-        ),
-    project_id: UUID = Query(
-            ...,
-            description="Проект. Пока query, позже будет из auth/context.",
-            examples=["22222222-2222-2222-2222-222222222222"],
-        ),
+    body: DeliverableBootstrapRequest = Body(..., openapi_examples=DELIVERABLE_BOOTSTRAP_OPENAPI_EXAMPLES),
+    actor_role: str = Depends(get_actor_role),
     db: Session = Depends(get_db),
 ):
+    # RBAC
+    try:
+        ensure_allowed("deliverable.bootstrap", actor_role)
+    except Forbidden as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
     service = DeliverableBootstrapService(db)
 
     try:
         with db.begin():
             result = service.bootstrap(
-                org_id=org_id,
-                project_id=project_id,
+                org_id=body.org_id,
+                project_id=body.project_id,
                 deliverable_id=deliverable_id,
             )
     except BootstrapError as e:
@@ -499,7 +532,7 @@ def bootstrap_deliverable(
         template_version_id=result.template_version_id,
         created_tasks=result.created_tasks,
         created_dependencies=result.created_dependencies,
-        )
+    )
 
 
 @router.post("/{deliverable_id}/fix-tasks", response_model=TaskRead)
@@ -512,18 +545,18 @@ def create_deliverable_fix(
     if not deliverable:
         raise HTTPException(404, "Deliverable not found")
 
-    fix = Task(
-        org_id=cmd.org_id,
-        deliverable_id=deliverable_id,
+    svc = TaskFixService(db)
+
+    fix = svc.create_initiative_fix_for_deliverable(
+        deliverable=deliverable,
+        actor_user_id=cmd.actor_user_id,
         title=cmd.payload.title,
         description=cmd.payload.description,
-        kind=TaskKind.fix,
-        fix_source=FixSource.worker_initiative,
-        fix_severity=cmd.payload.severity,
+        severity=cmd.payload.severity,
         minutes_spent=cmd.payload.minutes_spent,
-        created_by=cmd.actor_user_id,
+        attachments=[a.model_dump() for a in cmd.payload.attachments] if cmd.payload.attachments else None,
     )
-    db.add(fix)
+
     db.commit()
     db.refresh(fix)
     return fix

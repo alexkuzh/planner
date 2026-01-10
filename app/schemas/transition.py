@@ -1,9 +1,23 @@
-# app/schemas/transitions.py
+# app/schemas/transition.py
 from __future__ import annotations
-from pydantic import BaseModel, Field
+
+import enum
+from datetime import datetime
 from typing import Any, Optional
 from uuid import UUID
-from datetime import datetime
+
+from pydantic import BaseModel, Field
+
+
+class TaskAction(str, enum.Enum):
+    plan = "plan"
+    assign = "assign"
+    unassign = "unassign"
+    start = "start"
+    submit = "submit"
+    approve = "approve"
+    reject = "reject"
+
 
 class TaskTransitionRequest(BaseModel):
     org_id: UUID = Field(
@@ -17,17 +31,19 @@ class TaskTransitionRequest(BaseModel):
         description="Кто выполняет действие. Пока передаём явно, позже будет из auth.",
     )
 
-    action: str = Field(
+    action: TaskAction = Field(
         ...,
         examples=["plan", "assign", "start", "submit", "approve", "reject"],
         description="Действие FSM.",
     )
+
     expected_row_version: int = Field(
         ...,
         ge=1,
         examples=[1],
         description="Optimistic lock: ожидаемая версия строки задачи.",
     )
+
     client_event_id: Optional[UUID] = Field(
         default=None,
         examples=["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"],
@@ -82,10 +98,11 @@ class TaskTransitionResponse(BaseModel):
     row_version: int
     fix_task_id: Optional[UUID] = None
 
+
 class TaskTransitionItem(BaseModel):
     id: UUID
     task_id: UUID
-    action: str
+    action: TaskAction
     from_status: str
     to_status: str
     payload: dict[str, Any]

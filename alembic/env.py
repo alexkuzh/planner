@@ -7,7 +7,10 @@ from app.core.config import settings
 from app.models import Base  # важно, чтобы metadata подтянула модели
 
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.database_url)
+# Уважаем sqlalchemy.url из alembic.ini / alembic_test.ini (через -c),
+# и только если его нет — берём из settings.
+if not config.get_main_option("sqlalchemy.url"):
+    config.set_main_option("sqlalchemy.url", settings.database_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

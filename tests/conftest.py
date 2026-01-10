@@ -14,7 +14,7 @@ TEST_DATABASE_URL = os.getenv(
 
 @pytest.fixture(scope="session")
 def engine():
-    return create_engine(TEST_DATABASE_URL, pool_pre_ping=True)
+    return create_engine(TEST_DATABASE_URL, pool_pre_ping=True,  isolation_level="READ COMMITTED")
 
 @pytest.fixture(scope="session")
 def SessionLocal(engine):

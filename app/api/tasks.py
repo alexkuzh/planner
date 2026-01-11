@@ -28,10 +28,6 @@ from app.models.deliverable import Deliverable
 
 from app.api.deps import get_actor_role
 
-
-router = APIRouter(prefix="/tasks", tags=["tasks"])
-
-
 TASK_TRANSITION_OPENAPI_EXAMPLES = {
     "plan": {
         "summary": "Plan task",
@@ -130,6 +126,18 @@ REPORT_FIX_OPENAPI_EXAMPLES = {
         },
     }
 }
+
+router = APIRouter(prefix="/tasks", tags=["tasks"])
+
+
+def get_task_in_org_or_404(db: Session, *, org_id: UUID, task_id: UUID) -> Task:
+    task = db.execute(
+        select(Task).where(Task.org_id == org_id, Task.id == task_id)
+    ).scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
 
 @router.post("", response_model=TaskRead, status_code=status.HTTP_201_CREATED)
 def create_task(data: TaskCreate, db: Session = Depends(get_db)):
@@ -273,13 +281,25 @@ def add_dependency(
     return {"ok": True}
 
 
+from fastapi import Query
+
 @router.get("", response_model=list[TaskRead])
-def list_tasks(db: Session = Depends(get_db)):
+def list_tasks(
+    org_id: UUID = Query(..., description="Организация"),
+    project_id: UUID = Query(..., description="Проект"),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
     return (
         db.query(Task)
+        .filter(Task.org_id == org_id, Task.project_id == project_id)
         .order_by(Task.created_at.desc())
+        .limit(limit)
+        .offset(offset)
         .all()
     )
+
 
 
 @router.get("/{task_id}/transitions", response_model=list[TaskTransitionItem], response_model_exclude_none=True, )
@@ -411,12 +431,7 @@ def update_task(
     ),
     db: Session = Depends(get_db),
 ):
-    task = db.execute(
-        select(Task).where(Task.org_id == org_id, Task.id == task_id)
-    ).scalar_one_or_none()
-
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+    task = get_task_in_org_or_404(db, org_id=org_id, task_id=task_id)
 
     if payload.title is not None:
         task.title = payload.title
@@ -424,15 +439,10 @@ def update_task(
     if payload.deliverable_id is not None:
         task.deliverable_id = payload.deliverable_id
 
-    # В update_task убери обработку payload.status
-    # if payload.status is not None:
-    #     task.status = payload.status
-
     db.add(task)
     db.commit()
     db.refresh(task)
     return task
-
 
 
 @router.delete("/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -445,17 +455,11 @@ def delete_task(
     ),
     db: Session = Depends(get_db),
 ):
-    task = db.execute(
-        select(Task).where(Task.org_id == org_id, Task.id == task_id)
-    ).scalar_one_or_none()
-
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+    task = get_task_in_org_or_404(db, org_id=org_id, task_id=task_id)
 
     db.delete(task)
     db.commit()
     return None
-
 
 
 @router.delete("/{task_id}/dependencies/{predecessor_id}", status_code=204)

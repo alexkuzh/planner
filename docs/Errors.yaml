@@ -1,0 +1,130 @@
+version: 1
+name: Planner Error Contract
+description: >
+  Контракт ошибок системы Planner.
+  Ошибки являются частью публичного API и не должны меняться без версии.
+
+principles:
+  - error_is_part_of_contract
+  - http_status_must_match_semantics
+  - fsm_never_masks_errors
+  - qc_never_operates_task_fsm
+  - idempotency_is_strict
+
+format:
+  response:
+    type: object
+    required: [detail]
+    properties:
+      detail:
+        type: string
+        description: Human-readable error message (developer-facing)
+
+classes:
+
+  validation:
+    http_status: 422
+    description: Errors caused by invalid or semantically incorrect input.
+
+    errors:
+      ValidationError:
+        code: VALIDATION_ERROR
+        description: Invalid request payload or schema violation.
+        examples:
+          - detail: "Input should be 'plan', 'assign', 'start', 'submit', 'approve' or 'reject'"
+
+      TransitionNotAllowed:
+        code: TRANSITION_NOT_ALLOWED
+        description: FSM forbids transition from current status.
+        example:
+          detail: "Action 'reject' not allowed from status 'done'. Allowed from: in_review."
+
+      QCActionNotAllowedForTask:
+        code: QC_ACTION_NOT_ALLOWED_FOR_TASK
+        description: QC actions are forbidden in Task FSM (Variant A).
+        example:
+          detail: >
+            QC actions are not allowed for Task transitions.
+            Use qc_inspections / deliverable QC flow instead.
+
+      FixTaskPreconditionFailed:
+        code: FIX_TASK_PRECONDITION_FAILED
+        description: Preconditions for creating fix-task are not met.
+        example:
+          detail: "Cannot create fix-task: task is not linked to deliverable_id"
+
+  authorization:
+    http_status: 403
+    description: Access forbidden by RBAC.
+
+    errors:
+      Forbidden:
+        code: FORBIDDEN
+        description: Actor role is not allowed to perform the action.
+        example:
+          detail: "Role 'executor' is not allowed for 'task.assign'"
+
+  conflict:
+    http_status: 409
+    description: Concurrency or idempotency conflict.
+
+    errors:
+      VersionConflict:
+        code: VERSION_CONFLICT
+        description: Optimistic locking failed.
+        example:
+          detail: "Expected row_version=4, actual=6"
+
+      IdempotencyConflict:
+        code: IDEMPOTENCY_CONFLICT
+        description: client_event_id reused with different request data.
+        example:
+          detail: "client_event_id already used with different request data"
+
+  not_found:
+    http_status: 404
+    description: Requested resource does not exist.
+
+    errors:
+      TaskNotFound:
+        code: TASK_NOT_FOUND
+        description: Task does not exist or does not belong to org.
+        example:
+          detail: "Task not found"
+
+      DeliverableNotFound:
+        code: DELIVERABLE_NOT_FOUND
+        description: Deliverable does not exist.
+        example:
+          detail: "Deliverable not found"
+
+  internal:
+    http_status: 500
+    description: Internal server error (not part of business contract).
+
+    errors:
+      InternalServerError:
+        code: INTERNAL_SERVER_ERROR
+        description: Unexpected server-side failure.
+        example:
+          detail: "Internal Server Error"
+
+layer_mapping:
+  api_schema: [VALIDATION_ERROR]
+  rbac: [FORBIDDEN]
+  fsm: [TRANSITION_NOT_ALLOWED]
+  concurrency: [VERSION_CONFLICT]
+  idempotency: [IDEMPOTENCY_CONFLICT]
+  persistence: [TASK_NOT_FOUND, DELIVERABLE_NOT_FOUND]
+  infrastructure: [INTERNAL_SERVER_ERROR]
+
+forbidden_situations:
+  - direct_task_status_update
+  - task_status_change_without_transition
+  - qc_action_inside_task_fsm
+  - silent_idempotency_ignore
+
+guarantees:
+  - repeated_request_with_same_client_event_id_is_safe
+  - repeated_request_with_different_semantics_is_rejected
+  - task_status_changes_are_audited

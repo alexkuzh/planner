@@ -1,4 +1,4 @@
-.PHONY: up infra api down ps logs logs-db db psql migrate revision kill-port restart
+.PHONY: up infra api down ps logs logs-db db psql migrate revision kill-port restart pg-reset postman-run pg-top
 
 # Поднять только инфраструктуру (сейчас это Postgres)
 infra:
@@ -52,3 +52,23 @@ migrate:
 # Создать ревизию Alembic (пример: make revision m="add audit log")
 revision:
 	source .venv/bin/activate && alembic revision --autogenerate -m "$(m)"
+
+pg-reset:
+	docker exec -it planner_postgres psql -U planner -d planner -c "SELECT pg_stat_statements_reset();"
+
+postman-run:
+	newman run ./postman/collection.json \
+	  --env-var base_url=http://127.0.0.1:8000 \
+	  --env-var org_id=11111111-1111-1111-1111-111111111111 \
+	  --env-var project_id=22222222-2222-2222-2222-222222222222 \
+	  --env-var user_id=33333333-3333-3333-3333-333333333333 \
+	  --env-var role=lead \
+	  -n 200 --delay-request 50
+
+
+pg-top:
+	docker exec -it planner_postgres psql -U planner -d planner -c "\
+	SELECT calls, round(total_exec_time::numeric,2) AS total_ms, round(mean_exec_time::numeric,2) AS mean_ms, rows, left(query,220) AS query_short \
+	FROM pg_stat_statements \
+	ORDER BY total_exec_time DESC \
+	LIMIT 15;"

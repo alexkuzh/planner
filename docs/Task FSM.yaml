@@ -1,0 +1,168 @@
+version: 1
+name: Task FSM (Variant A)
+entity: task
+description: >
+  FSM для задач (Task). Вариант A: QC НЕ управляет Task FSM.
+  QC работает через qc_inspections / deliverable QC flow.
+
+enums:
+  statuses:
+    - new
+    - planned
+    - assigned
+    - in_progress
+    - in_review
+    - rejected
+    - done
+    - canceled
+
+  actions:
+    - plan
+    - assign
+    - unassign
+    - start
+    - submit
+    - approve
+    - reject
+    - cancel
+
+guards:
+  qc_actions_forbidden:
+    rule: "action starts_with 'qc_'"
+    error:
+      http_status: 422
+      detail: >
+        QC actions are not allowed for Task transitions.
+        Use qc_inspections / deliverable QC flow instead.
+
+payload_schema:
+  plan:
+    required: []
+    optional: []
+  assign:
+    required: [assign_to]
+    optional: []
+    fields:
+      assign_to:
+        type: uuid
+        description: "User id of executor"
+  unassign:
+    required: []
+    optional: []
+  start:
+    required: []
+    optional: []
+  submit:
+    required: []
+    optional: []
+  approve:
+    required: []
+    optional: []
+  reject:
+    required: []
+    optional: [reason, fix_title, severity, assign_to]
+    fields:
+      reason:
+        type: string
+        normalize: trim
+      fix_title:
+        type: string
+        normalize: trim
+      severity:
+        type: enum
+        enum: [minor, major, critical]
+        default: major
+      assign_to:
+        type: uuid
+        description: "Optional: who to assign fix-task to"
+  cancel:
+    required: []
+    optional: [reason]
+    fields:
+      reason:
+        type: string
+        normalize: trim
+
+side_effects:
+  create_fix_task:
+    key: create_fix_task
+    description: >
+      Создаёт fix-task при reject (если задача связана с deliverable).
+    preconditions:
+      - rule: "task.deliverable_id is not null"
+        error:
+          http_status: 422
+          detail: "Cannot create fix-task: task is not linked to deliverable_id"
+    payload_mapping:
+      reason_from: payload.reason
+      title_from: payload.fix_title
+      assign_to_from: payload.assign_to
+      severity_from: payload.severity
+    result:
+      writes_payload_field: fix_task_id
+
+transitions:
+  - from: new
+    action: plan
+    to: planned
+
+  - from: planned
+    action: assign
+    to: assigned
+
+  - from: assigned
+    action: unassign
+    to: planned
+
+  - from: assigned
+    action: start
+    to: in_progress
+
+  - from: in_progress
+    action: submit
+    to: in_review
+
+  - from: in_review
+    action: approve
+    to: done
+
+  - from: in_review
+    action: reject
+    to: rejected
+    effects:
+      - create_fix_task
+
+  - from: new
+    action: cancel
+    to: canceled
+
+  - from: planned
+    action: cancel
+    to: canceled
+
+  - from: assigned
+    action: cancel
+    to: canceled
+
+  - from: in_progress
+    action: cancel
+    to: canceled
+
+  - from: rejected
+    action: cancel
+    to: canceled
+
+allowed_from_map:
+  plan: [new]
+  assign: [planned]
+  unassign: [assigned]
+  start: [assigned]
+  submit: [in_progress]
+  approve: [in_review]
+  reject: [in_review]
+  cancel: [new, planned, assigned, in_progress, rejected]
+
+notes:
+  - "done is terminal: no transitions out in Variant A"
+  - "rejected is terminal for the origin task; fix-task is created as a separate task"
+  - "idempotency requires same client_event_id => same action/payload/expected_row_version"

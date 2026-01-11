@@ -8,6 +8,15 @@ from typing import Any
 
 from app.models.task import TaskStatus
 
+"""
+Task FSM: производственный цикл задачи.
+
+ВАЖНО (архитектурное правило, Variant A):
+- QC НЕ управляет состояниями Task напрямую.
+- QC работает через qc_inspections (отдельная сущность/поток).
+- Поэтому в TaskAction НЕ должно быть действий вида qc_* (qc_reject и т.п.).
+- Все статусы Task меняются только действиями: plan/assign/start/submit/approve/reject/(cancel?).
+"""
 
 class TransitionNotAllowed(Exception):
     pass

@@ -9,6 +9,7 @@ from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy import inspect
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
@@ -19,6 +20,12 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    bind = op.get_bind()
+    insp = inspect(bind)
+    cols = {c["name"] for c in insp.get_columns("task_transitions")}
+    if "project_id" in cols:
+        return
+
     # 1) add nullable column first
     op.add_column("task_transitions", sa.Column("project_id", postgresql.UUID(as_uuid=True), nullable=True))
 

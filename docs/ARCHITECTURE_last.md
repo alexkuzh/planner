@@ -1,4 +1,4 @@
-# ARCHITECTURE.md
+    # ARCHITECTURE.md
 
 ## 0. Цель проекта
 
@@ -64,7 +64,17 @@
 - создаётся fix-task через `TaskFixService.create_qc_reject_fix(...)`
 - определяется `responsible_user_id` как последний approved signoff
 
----
+## QC (Variant A)
+QC не изменяет Task напрямую и не использует endpoint `/tasks/{task_id}/transitions`.
+
+- Task FSM: планирование/назначение/выполнение/сдача/принятие лидом.
+  Действия: plan, assign, start, submit, approve, reject (cancel — опционально).
+- QC поток: отдельная сущность `qc_inspections`.
+  QC фиксирует результат инспекции (pass/fail, замечания, вложения).
+- Создание fix-task происходит как следствие QC fail (или reject лидом),
+  но это не отдельный action в Task FSM (никаких `qc_reject`, `qc_*`).
+
+--- 
 
 ## 2. Инварианты (обязательные правила)
 

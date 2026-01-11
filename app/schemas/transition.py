@@ -16,6 +16,7 @@ class TaskAction(str, enum.Enum):
     start = "start"
     submit = "submit"
     approve = "approve"
+    cancel = "cancel"
     reject = "reject"
 
 

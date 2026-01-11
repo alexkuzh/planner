@@ -8,12 +8,12 @@ from sqlalchemy.orm import Session
 from uuid import UUID
 
 from app.services.task_fix_service import TaskFixService
-from app.services.task_transition_service import apply_task_transition, VersionConflict
+from app.services.task_transition_service import apply_task_transition, VersionConflict, IdempotencyConflict
 
 from app.core.db import get_db
 from app.core.rbac import ensure_allowed, Forbidden
 
-from app.fsm.task_fsm import TransitionNotAllowed, apply_transition
+from app.fsm.task_fsm import TransitionNotAllowed
 
 from app.schemas.task import TaskCreate, TaskRead, TaskUpdate, TaskBlockerRead, TaskDependencyCreate, TaskDependencyRead
 from app.schemas.task_event import TaskEventRead
@@ -178,6 +178,15 @@ def transition_task(
     actor_role: str = Depends(get_actor_role),
     db: Session = Depends(get_db),
 ):
+    # --- Guard: QC actions are not allowed in Task FSM (Variant A) ---
+    if payload.action.startswith("qc_"):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "QC actions are not allowed for Task transitions. "
+                "Use qc_inspections / deliverable QC flow instead."
+            ),
+        )
     # RBAC: разрешение зависит от action
     try:
         ensure_allowed(f"task.{payload.action}", actor_role)
@@ -186,16 +195,19 @@ def transition_task(
 
     try:
         with db.begin():
-            task, fix_task = apply_task_transition(
-                db,
-                org_id=payload.org_id,
-                actor_user_id=payload.actor_user_id,
-                task_id=task_id,
-                action=payload.action,
-                expected_row_version=payload.expected_row_version,
-                payload=payload.payload,
-                client_event_id=payload.client_event_id,
-            )
+            try:
+                task, fix_task = apply_task_transition(
+                    db,
+                    org_id=payload.org_id,
+                    actor_user_id=payload.actor_user_id,
+                    task_id=task_id,
+                    action=payload.action,
+                    expected_row_version=payload.expected_row_version,
+                    payload=payload.payload,
+                    client_event_id=payload.client_event_id,
+                )
+            except IdempotencyConflict as e:
+                raise HTTPException(status_code=409, detail=str(e))
 
         return TaskTransitionResponse(
             task_id=task.id,
@@ -358,8 +370,17 @@ def list_task_blockers(
 
 
 @router.get("/{task_id}", response_model=TaskRead)
-def get_task(task_id: UUID, db: Session = Depends(get_db)):
-    task = db.get(Task, task_id)
+def get_task(
+    task_id: UUID,
+    org_id: UUID = Query(
+        ...,
+        description="Организация (мультитенантность). Пока query, позже будет из auth.",
+        examples=["11111111-1111-1111-1111-111111111111"],
+        ),
+    db: Session = Depends(get_db),
+    ):
+    task = db.execute(select(Task).where(Task.org_id == org_id, Task.id == task_id)).scalar_one_or_none()
+
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return task
@@ -380,17 +401,32 @@ def list_task_events(task_id: UUID, db: Session = Depends(get_db)):
 
 
 @router.patch("/{task_id}", response_model=TaskRead)
-def update_task(task_id: UUID, payload: TaskUpdate, db: Session = Depends(get_db)):
-    task = db.get(Task, task_id)
+def update_task(
+    task_id: UUID,
+    payload: TaskUpdate,
+    org_id: UUID = Query(
+        ...,
+        description="Организация (мультитенантность). Пока query, позже будет из auth.",
+        examples=["11111111-1111-1111-1111-111111111111"],
+    ),
+    db: Session = Depends(get_db),
+):
+    task = db.execute(
+        select(Task).where(Task.org_id == org_id, Task.id == task_id)
+    ).scalar_one_or_none()
+
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
     if payload.title is not None:
         task.title = payload.title
 
+    if payload.deliverable_id is not None:
+        task.deliverable_id = payload.deliverable_id
+
     # В update_task убери обработку payload.status
-    #if payload.status is not None:
-    #    task.status = payload.status
+    # if payload.status is not None:
+    #     task.status = payload.status
 
     db.add(task)
     db.commit()
@@ -398,15 +434,28 @@ def update_task(task_id: UUID, payload: TaskUpdate, db: Session = Depends(get_db
     return task
 
 
+
 @router.delete("/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_task(task_id: UUID, db: Session = Depends(get_db)):
-    task = db.get(Task, task_id)
+def delete_task(
+    task_id: UUID,
+    org_id: UUID = Query(
+        ...,
+        description="Организация (мультитенантность). Пока query, позже будет из auth.",
+        examples=["11111111-1111-1111-1111-111111111111"],
+    ),
+    db: Session = Depends(get_db),
+):
+    task = db.execute(
+        select(Task).where(Task.org_id == org_id, Task.id == task_id)
+    ).scalar_one_or_none()
+
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
     db.delete(task)
     db.commit()
     return None
+
 
 
 @router.delete("/{task_id}/dependencies/{predecessor_id}", status_code=204)

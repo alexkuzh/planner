@@ -3,6 +3,7 @@ services:
     image: postgres:16
     container_name: planner_postgres
     restart: unless-stopped
+    command: [ "postgres", "-c", "shared_preload_libraries=pg_stat_statements" ]
     environment:
       POSTGRES_DB: planner
       POSTGRES_USER: planner

@@ -5,8 +5,25 @@ from typing import Mapping, Set
 
 
 class Forbidden(Exception):
-    """Raise when actor role is not allowed for an operation."""
+    """Raised when actor role is not allowed for an operation."""
     pass
+
+
+def _aliases(prefix: str, actions: Set[str]) -> Set[str]:
+    """
+    Build permission-key aliases for the same logical action.
+
+    In the codebase we may generate permissions in different formats, e.g.:
+      - "task.plan"
+      - "task.TaskAction.plan"
+
+    To avoid RBAC drift during MVP, we whitelist both formats.
+    """
+    out: Set[str] = set()
+    for a in actions:
+        out.add(f"{prefix}.{a}")
+        out.add(f"{prefix}.TaskAction.{a}")
+    return out
 
 
 # MVP roles (stringly-typed on purpose; later replace with Enum/JWT claims)
@@ -20,13 +37,11 @@ ALLOW: Mapping[str, Set[str]] = {
     "deliverable.signoff": {"lead", "responsible"},
 
     # ---- Tasks (FSM transitions) ----
-    "task.plan": {"system", "lead"},
-    "task.assign": {"lead", "supervisor"},
-    "task.unassign": {"lead", "supervisor"},
-    "task.start": {"executor", "lead"},
-    "task.submit": {"executor", "lead"},
-    "task.approve": {"lead", "supervisor"},
-    "task.reject": {"lead", "supervisor"},
+    # Note: accept both "task.<action>" and "task.TaskAction.<action>" to match
+    # whatever permission-key format a caller uses.
+    **{k: {"system", "lead"} for k in _aliases("task", {"plan"})},
+    **{k: {"lead", "supervisor"} for k in _aliases("task", {"assign", "unassign", "approve", "reject"})},
+    **{k: {"executor", "lead"} for k in _aliases("task", {"start", "submit"})},
 
     # ---- Fix tasks ----
     "fix.worker_initiative": {"qualified_worker", "executor", "lead", "supervisor"},

@@ -9,6 +9,7 @@ from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy import inspect
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
@@ -20,6 +21,14 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     bind = op.get_bind()
+
+    insp = inspect(bind)
+    if insp.has_table("tasks"):
+        cols = {c["name"] for c in insp.get_columns("tasks")}
+        # В основной БД 'planner' схема уже собрана; эта миграция была полезна для rebuild в тестовой/переходной базе.
+        if "project_id" in cols:
+            return
+
 
     # --- enums (если уже есть - не создаст заново) ---
     work_kind = postgresql.ENUM("work", "fix", name="work_kind", create_type=False)

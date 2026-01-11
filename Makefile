@@ -1,21 +1,29 @@
-.PHONY: up infra api down ps logs logs-db db psql migrate revision
+.PHONY: up infra api down ps logs logs-db db psql migrate revision kill-port restart
 
 # Поднять только инфраструктуру (сейчас это Postgres)
 infra:
 	docker compose up -d
 
+# Убить процессы, слушающие порт API (по умолчанию 8000)
+# Безопасно: скрипт убивает только python/uvicorn на этом порту.
+kill-port:
+	./scripts/kill_port.sh 8000
+
 # Запустить API локально (в venv)
-api:
+api: kill-port
 	source .venv/bin/activate && python -m uvicorn app.main:app --reload --port 8000
 
 # Всё сразу: Postgres + API
-up:
+up: kill-port
 	docker compose up -d
 	source .venv/bin/activate && python -m uvicorn app.main:app --reload --port 8000
 
 # Остановить контейнеры
 down:
 	docker compose down
+
+# restart
+restart: down up
 
 # Показать статус контейнеров
 ps:

@@ -9,6 +9,7 @@ from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy import inspect
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
@@ -20,6 +21,14 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    bind = op.get_bind()
+    insp = inspect(bind)
+
+    cols = {c["name"] for c in insp.get_columns("tasks")}
+    if "project_id" in cols:
+        # колонка уже есть — миграция должна быть идемпотентной
+        return
+
     # 1) добавляем колонку (для существующих строк даём временный default)
     op.add_column(
         "tasks",
@@ -31,7 +40,7 @@ def upgrade() -> None:
         ),
     )
 
-    # 2) убираем default, чтобы приложение всегда присылало project_id само
+    # 2) убираем default
     op.alter_column("tasks", "project_id", server_default=None)
 
 

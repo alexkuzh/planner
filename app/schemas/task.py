@@ -42,7 +42,7 @@ class TaskUpdate(BaseModel):
     title: Optional[str] = Field(default=None, min_length=1, max_length=300)
     # Убираем статус, запрети менять status через общий PATCH
     # status: Optional[TaskStatus] = None
-
+    deliverable_id: Optional[UUID] = None
 
 class TaskRead(BaseModel):
     id: UUID

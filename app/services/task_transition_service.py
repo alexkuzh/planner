@@ -141,6 +141,11 @@ def _load_result_by_transition(db: Session, tr: TaskTransition) -> tuple[Task, T
     return task, fix_task
 
 
+# NOTE (Variant A):
+# Этот сервис обслуживает ТОЛЬКО переходы Task FSM.
+# QC не вызывает /tasks/{id}/transitions и не добавляет сюда qc_* actions.
+# QC-сценарии живут отдельно (qc_inspections) и могут создавать fix-task,
+# но НЕ через дополнительные действия Task FSM.
 
 def apply_task_transition(
     db: Session,
@@ -158,6 +163,7 @@ def apply_task_transition(
     # NOTE: нормализуем payload для:
     # 1) строгого idempotency-сравнения по смыслу
     # 2) стабильного хранения payload в task_transitions
+
     payload_norm = _normalize_payload_for_idempotency(action, payload)
 
     # 0) Idempotency (strict)

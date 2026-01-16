@@ -110,7 +110,9 @@ class DeliverableBootstrapService:
                 title=n.title,
                 description=n.description,
                 priority=n.priority,
-                status=TaskStatus.planned.value,  # важно: не in_progress автоматически
+                # По финальной модели: задачи создаются в blocked и переходят в available,
+                # когда зависимости/хо... (см. ARCHITECTURE.md)
+                status=TaskStatus.blocked.value,
                 kind=n.kind,
                 work_kind=WorkKind.work,  # ⬅️ страховка: bootstrap всегда создаёт обычные work-задачи
                 other_kind_label=None,

@@ -15,12 +15,11 @@ from app.models.base import Base
 
 
 class TaskStatus(str, enum.Enum):
-    new = "new"
-    planned = "planned"
+    blocked = "blocked"
+    available = "available"
     assigned = "assigned"
     in_progress = "in_progress"
-    in_review = "in_review"
-    rejected = "rejected"
+    submitted = "submitted"
     done = "done"
     canceled = "canceled"
 
@@ -73,8 +72,10 @@ class Task(Base):
     title: Mapped[str] = mapped_column(Text, nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # В БД у тебя text/string — оставляем так, но используем TaskStatus values
-    status: Mapped[str] = mapped_column(String, nullable=False, default=TaskStatus.new.value)
+    # В БД у тебя text/string — оставляем так, но используем TaskStatus values.
+    # В финальной модели нет 'new/planned': новая задача по умолчанию 'blocked'
+    # (до тех пор пока зависимости/холды не разрешены и задача не станет 'available').
+    status: Mapped[str] = mapped_column(String, nullable=False, default=TaskStatus.blocked.value)
 
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 

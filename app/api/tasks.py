@@ -30,80 +30,128 @@ from app.models.deliverable import Deliverable
 from app.api.deps import get_actor_role
 
 TASK_TRANSITION_OPENAPI_EXAMPLES = {
-    "plan": {
-        "summary": "Plan task",
-        "description": "Перевести задачу в planned (обычно системное/лидское действие).",
+    "unblock": {
+        "summary": "Unblock task",
+        "description": "Перевести задачу из blocked в available (готова к выдаче/выбору).",
         "value": {
             "org_id": "11111111-1111-1111-1111-111111111111",
             "actor_user_id": "33333333-3333-3333-3333-333333333333",
-            "action": "plan",
+            "action": "unblock",
             "expected_row_version": 1,
             "client_event_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             "payload": {},
         },
     },
+    "self_assign": {
+        "summary": "Self-assign (pick from pool)",
+        "description": "Исполнитель выбирает задачу из пула (available -> assigned).",
+        "value": {
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "actor_user_id": "33333333-3333-3333-3333-333333333333",
+            "action": "self_assign",
+            "expected_row_version": 2,
+            "client_event_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "payload": {},
+        },
+    },
     "assign": {
-        "summary": "Assign task",
-        "description": "Назначить исполнителя.",
+        "summary": "Assign task (leader)",
+        "description": "Лид назначает исполнителя (available -> assigned).",
         "value": {
             "org_id": "11111111-1111-1111-1111-111111111111",
             "actor_user_id": "33333333-3333-3333-3333-333333333333",
             "action": "assign",
-            "expected_row_version": 2,
-            "client_event_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "expected_row_version": 3,
+            "client_event_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
             "payload": {"assign_to": "33333333-3333-3333-3333-333333333333"},
         },
     },
     "start": {
         "summary": "Start task",
-        "description": "Взять задачу в работу.",
+        "description": "Начать работу (assigned -> in_progress).",
         "value": {
             "org_id": "11111111-1111-1111-1111-111111111111",
             "actor_user_id": "33333333-3333-3333-3333-333333333333",
             "action": "start",
-            "expected_row_version": 3,
-            "client_event_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "expected_row_version": 4,
+            "client_event_id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
             "payload": {},
         },
     },
     "submit": {
         "summary": "Submit task",
-        "description": "Отправить на ревью/проверку.",
+        "description": "Отправить результат на проверку (in_progress -> submitted).",
         "value": {
             "org_id": "11111111-1111-1111-1111-111111111111",
             "actor_user_id": "33333333-3333-3333-3333-333333333333",
             "action": "submit",
-            "expected_row_version": 4,
-            "client_event_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
-            "payload": {},
-        },
-    },
-    "approve": {
-        "summary": "Approve task",
-        "description": "Подтвердить (ревьюер/лид).",
-        "value": {
-            "org_id": "11111111-1111-1111-1111-111111111111",
-            "actor_user_id": "33333333-3333-3333-3333-333333333333",
-            "action": "approve",
             "expected_row_version": 5,
-            "client_event_id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+            "client_event_id": "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
             "payload": {},
         },
     },
-    "reject": {
-        "summary": "Reject task",
-        "description": "Отклонить и (опционально) создать fix-task.",
+    "review_approve": {
+        "summary": "Approve submitted task",
+        "description": "Принять результат (submitted -> done).",
         "value": {
             "org_id": "11111111-1111-1111-1111-111111111111",
             "actor_user_id": "33333333-3333-3333-3333-333333333333",
-            "action": "reject",
+            "action": "review_approve",
             "expected_row_version": 6,
-            "client_event_id": "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+            "client_event_id": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            "payload": {},
+        },
+    },
+    "review_reject": {
+        "summary": "Reject submitted task",
+        "description": "Отклонить результат и вернуть в работу (submitted -> in_progress).",
+        "value": {
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "actor_user_id": "33333333-3333-3333-3333-333333333333",
+            "action": "review_reject",
+            "expected_row_version": 7,
+            "client_event_id": "11111111-2222-3333-4444-555555555555",
             "payload": {
                 "reason": "Найдены дефекты, требуется доработка",
                 "fix_title": "Исправить дефекты по задаче",
-                "assign_to": "33333333-3333-3333-3333-333333333333",
+                "assign_to": "33333333-3333-3333-3333-333333333333"
             },
+        },
+    },
+    "shift_release": {
+        "summary": "Shift release",
+        "description": "Автоматически вернуть задачу в пул в конце смены (assigned/in_progress -> available).",
+        "value": {
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "actor_user_id": "33333333-3333-3333-3333-333333333333",
+            "action": "shift_release",
+            "expected_row_version": 8,
+            "client_event_id": "22222222-2222-3333-4444-555555555555",
+            "payload": {},
+        },
+    },
+    "recall_to_pool": {
+        "summary": "Recall to pool (leader)",
+        "description": "Лид принудительно отзывает задачу в пул (assigned/in_progress -> available).",
+        "value": {
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "actor_user_id": "33333333-3333-3333-3333-333333333333",
+            "action": "recall_to_pool",
+            "expected_row_version": 9,
+            "client_event_id": "33333333-2222-3333-4444-555555555555",
+            "payload": {},
+        },
+    },
+    "escalate": {
+        "summary": "Escalate",
+        "description": "Сигнал лидu: нужна помощь/переназначение (без смены статуса).",
+        "value": {
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "actor_user_id": "33333333-3333-3333-3333-333333333333",
+            "action": "escalate",
+            "expected_row_version": 10,
+            "client_event_id": "44444444-2222-3333-4444-555555555555",
+            "payload": {"message": "Нужна помощь: нет инструмента/не уверен в операции"},
         },
     },
 }
@@ -156,7 +204,9 @@ def create_task(data: TaskCreate, db: Session = Depends(get_db)):
         title=data.title,
         description=data.description,
         priority=data.priority,
-        status=TaskStatus.new.value,  # или просто "new"
+        # По финальной модели задачи создаются в blocked и становятся available
+        # только после разрешения зависимостей/холдов.
+        status=TaskStatus.blocked.value,
 
         kind=data.kind.value if hasattr(data.kind, "value") else str(data.kind),
         work_kind=WorkKind.work,  # ⬅️ СТРАХОВКА
@@ -177,7 +227,7 @@ def create_task(data: TaskCreate, db: Session = Depends(get_db)):
     response_model_exclude_none=True,
     summary="Apply FSM transition to task",
     description=(
-        "Применяет действие FSM к задаче (например: plan/assign/start/submit/approve/reject).\n\n"
+        "Применяет действие FSM к задаче (например: unblock/self_assign/assign/start/submit/review_approve/review_reject/shift_release/recall_to_pool/escalate).\n\n"
         "Требует optimistic lock: expected_row_version должен совпадать с текущим row_version задачи.\n"
         "payload зависит от action (см. примеры в Swagger)."
     ),

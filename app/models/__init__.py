@@ -1,3 +1,4 @@
+import app.models  # noqa: F401
 from app.models.base import Base
 from app.models.task import Task
 from app.models.task_event import TaskEvent

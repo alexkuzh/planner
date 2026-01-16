@@ -8,66 +8,87 @@ from typing import Any
 
 from app.models.task import TaskStatus
 
-"""
-Task FSM: производственный цикл задачи.
+"""Task FSM: производственный цикл задачи.
 
-ВАЖНО (архитектурное правило, Variant A):
+Финальная модель (без planned/in_review/rejected):
+  blocked -> available -> assigned -> in_progress -> submitted -> done
+  cancel -> canceled
+
+ВАЖНО:
 - QC НЕ управляет состояниями Task напрямую.
-- QC работает через qc_inspections (отдельная сущность/поток).
-- Поэтому в TaskAction НЕ должно быть действий вида qc_* (qc_reject и т.п.).
-- Все статусы Task меняются только действиями: plan/assign/start/submit/approve/reject/(cancel?).
+- QC работает через qc_inspections / deliverable QC flow.
+- Поэтому в Task FSM НЕ должно быть действий вида qc_*.
 """
+
 
 class TransitionNotAllowed(Exception):
     pass
 
 
 class Action(str, Enum):
-    PLAN = "plan"
-    ASSIGN = "assign"
-    UNASSIGN = "unassign"
-    START = "start"
-    SUBMIT = "submit"
-    APPROVE = "approve"
-    REJECT = "reject"
+    # pool readiness
+    UNBLOCK = "unblock"  # blocked -> available
+
+    # assignment
+    SELF_ASSIGN = "self_assign"  # available -> assigned
+    ASSIGN = "assign"  # available -> assigned (lead/supervisor)
+
+    # execution
+    START = "start"  # assigned -> in_progress
+    SUBMIT = "submit"  # in_progress -> submitted
+
+    # review
+    REVIEW_APPROVE = "review_approve"  # submitted -> done
+    REVIEW_REJECT = "review_reject"  # submitted -> in_progress (+ optional fix-task)
+
+    # controlled return to pool
+    SHIFT_RELEASE = "shift_release"  # assigned/in_progress -> available
+    RECALL_TO_POOL = "recall_to_pool"  # assigned/in_progress -> available
+
+    # flag / signal (no status change)
+    ESCALATE = "escalate"
+
+    # terminal
     CANCEL = "cancel"
 
 
 @dataclass(frozen=True)
 class SideEffect:
     """Declarative side effects for the service layer to execute."""
+
     kind: str
     payload: dict[str, Any]
 
 
-# Какие статусы считаем "не финальными"
 NON_TERMINAL = {
-    TaskStatus.new,
-    TaskStatus.planned,
+    TaskStatus.blocked,
+    TaskStatus.available,
     TaskStatus.assigned,
     TaskStatus.in_progress,
-    TaskStatus.in_review,
+    TaskStatus.submitted,
 }
 
 TERMINAL = {
     TaskStatus.done,
-    TaskStatus.rejected,
     TaskStatus.canceled,
 }
 
 
 # action -> allowed from statuses + to status
-# Важно: start только из assigned (а не из new)
 TRANSITIONS: dict[Action, tuple[set[TaskStatus], TaskStatus]] = {
-    Action.PLAN: ({TaskStatus.new}, TaskStatus.planned),
-    Action.ASSIGN: ({TaskStatus.new, TaskStatus.planned}, TaskStatus.assigned),
-    Action.UNASSIGN: ({TaskStatus.assigned}, TaskStatus.planned),
+    Action.UNBLOCK: ({TaskStatus.blocked}, TaskStatus.available),
+
+    Action.SELF_ASSIGN: ({TaskStatus.available}, TaskStatus.assigned),
+    Action.ASSIGN: ({TaskStatus.available}, TaskStatus.assigned),
 
     Action.START: ({TaskStatus.assigned}, TaskStatus.in_progress),
-    Action.SUBMIT: ({TaskStatus.in_progress}, TaskStatus.in_review),
+    Action.SUBMIT: ({TaskStatus.in_progress}, TaskStatus.submitted),
 
-    Action.APPROVE: ({TaskStatus.in_review}, TaskStatus.done),
-    Action.REJECT: ({TaskStatus.in_review}, TaskStatus.rejected),
+    Action.REVIEW_APPROVE: ({TaskStatus.submitted}, TaskStatus.done),
+    Action.REVIEW_REJECT: ({TaskStatus.submitted}, TaskStatus.in_progress),
+
+    Action.SHIFT_RELEASE: ({TaskStatus.assigned, TaskStatus.in_progress}, TaskStatus.available),
+    Action.RECALL_TO_POOL: ({TaskStatus.assigned, TaskStatus.in_progress}, TaskStatus.available),
 
     Action.CANCEL: (NON_TERMINAL, TaskStatus.canceled),
 }
@@ -79,10 +100,11 @@ def apply_transition(
     *,
     payload: dict[str, Any] | None = None,
 ) -> tuple[TaskStatus, list[SideEffect]]:
-    """
-    Returns (new_status, side_effects).
+    """Returns (new_status, side_effects).
+
     Side effects are executed by the service layer in the same DB transaction.
     """
+
     payload = payload or {}
     action_raw = action_raw.strip()
 
@@ -91,6 +113,12 @@ def apply_transition(
     except ValueError:
         allowed = ", ".join(a.value for a in Action)
         raise TransitionNotAllowed(f"Unknown action: '{action_raw}'. Allowed actions: {allowed}")
+
+    # ESCALATE does not change status, but can produce a side-effect.
+    if action is Action.ESCALATE:
+        if current in TERMINAL:
+            raise TransitionNotAllowed("Action 'escalate' not allowed from terminal status")
+        return current, [SideEffect(kind="escalate", payload={"message": (payload.get("message") or "").strip()})]
 
     allowed_from, to_status = TRANSITIONS[action]
     if current not in allowed_from:
@@ -102,8 +130,9 @@ def apply_transition(
 
     side_effects: list[SideEffect] = []
 
-    # Reject => create fix-task (в MVP — всегда, чтобы не было "сломал данные")
-    if action is Action.REJECT:
+    # REVIEW_REJECT may optionally create a fix-task (policy-level). We keep the payload shape
+    # compatible with the previous implementation.
+    if action is Action.REVIEW_REJECT:
         reason = (payload.get("reason") or "").strip()
         fix_title = (payload.get("fix_title") or "").strip()
         assign_to = payload.get("assign_to")  # optional user_id

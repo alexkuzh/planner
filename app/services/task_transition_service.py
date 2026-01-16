@@ -112,22 +112,51 @@ def _normalize_payload_for_idempotency(action: str, payload: dict[str, Any]) -> 
     if "user_id" in p:
         p["user_id"] = _to_uuid_str(p.get("user_id"))
 
-    # --- reject semantics ---
-    if action == "reject":
+    # --- review_reject semantics (submitted -> in_progress + optional fix-task) ---
+    if action in ("review_reject", "reject"):
         # reason/fix_title сравниваем без "шумовых" пробелов по краям
         if "reason" in p and p["reason"] is not None:
             p["reason"] = str(p["reason"]).strip()
         if "fix_title" in p and p["fix_title"] is not None:
             p["fix_title"] = str(p["fix_title"]).strip()
 
-        # severity может прийти как Enum или как строка
+        # severity может прийти как Enum или как строка (backward compatibility)
         sev = p.get("severity", None)
         if isinstance(sev, Enum):
             p["severity"] = str(sev.value)
         elif sev is not None:
             p["severity"] = str(sev)
 
+    if action == "escalate":
+        if "message" in p and p["message"] is not None:
+            p["message"] = str(p["message"]).strip()
+
     return p
+
+
+def _enforce_wip_limit(db: Session, *, org_id: UUID, executor_id: UUID, exclude_task_id: UUID) -> None:
+    """Enforce "one active task per executor" for primary assignment.
+
+    Active = assigned / in_progress / submitted.
+    """
+
+    active_statuses = {
+        TaskStatus.assigned.value,
+        TaskStatus.in_progress.value,
+        TaskStatus.submitted.value,
+    }
+
+    existing = db.execute(
+        select(Task.id).where(
+            Task.org_id == org_id,
+            Task.assigned_to == executor_id,
+            Task.id != exclude_task_id,
+            Task.status.in_(active_statuses),
+        )
+    ).scalar_one_or_none()
+
+    if existing is not None:
+        raise TransitionNotAllowed("WIP limit exceeded: executor already has an active task")
 
 def _load_result_by_transition(db: Session, tr: TaskTransition) -> tuple[Task, Task | None]:
     task = db.execute(
@@ -204,6 +233,10 @@ def apply_task_transition(
 
 
     # 3) FSM (но Task пока НЕ меняем)
+    # Дополнительные инварианты/предохранители уровня сервиса.
+    if action == "unblock" and task.assigned_to is not None:
+        raise TransitionNotAllowed("Cannot unblock: task is assigned")
+
     to_status, side_effects = apply_transition(from_status, action, payload=payload)
 
     # 4) Prepare payload for transition (включая fix_task_id, если появится)
@@ -213,9 +246,14 @@ def apply_task_transition(
     # 5) Side effects (reject => create fix-task) — может добавить fix_task_id в payload
     for eff in side_effects:
         if eff.kind == FIX_EFFECT_CREATE:
+            # REVIEW_REJECT policy: фиксируем, что исправить и что исправлено.
+            # Для MVP требуем хотя бы `reason` (что исправить).
             reason = (eff.payload.get("reason") or "").strip()
             fix_title = (eff.payload.get("fix_title") or "").strip()
             severity = _parse_severity(eff.payload.get("severity"))
+
+            if not reason:
+                raise TransitionNotAllowed("Action 'review_reject' requires payload.reason (what to fix).")
 
             if task.deliverable_id is None:
                 raise TransitionNotAllowed("Cannot create fix-task: task is not linked to deliverable_id")
@@ -227,7 +265,7 @@ def apply_task_transition(
                 deliverable_id=task.deliverable_id,
                 actor_user_id=actor_user_id,
                 title=fix_title or f"Fix: {task.title}",
-                description=reason or None,
+                description=reason,
                 source=FixSource.supervisor_request,
                 severity=severity,
                 minutes_spent=None,
@@ -280,15 +318,34 @@ def apply_task_transition(
         db.execute(stmt)
 
     # 7) ТОЛЬКО если transition реально вставился — применяем изменения к Task
-    if action == "assign":
+    # Assignment mutations are centralized here to keep FSM pure.
+    if action in ("self_assign", "assign"):
+        # self_assign: executor picks from pool
+        # assign: lead/supervisor assigns from pool
         assign_to = payload_norm.get("assign_to") or payload_norm.get("user_id")
-        if not assign_to:
-            raise TransitionNotAllowed("Action 'assign' требует payload.assign_to (user_id).")
-        task.assigned_to = UUID(str(assign_to))
+        if action == "self_assign":
+            executor_id = actor_user_id
+        else:
+            if not assign_to:
+                raise TransitionNotAllowed("Action 'assign' requires payload.assign_to (user_id).")
+            executor_id = UUID(str(assign_to))
+
+        _enforce_wip_limit(db, org_id=org_id, executor_id=executor_id, exclude_task_id=task.id)
+        task.assigned_to = executor_id
         task.assigned_at = _now()
-    elif action == "unassign":
+
+    elif action in ("shift_release", "recall_to_pool"):
+        # controlled return to pool
         task.assigned_to = None
         task.assigned_at = None
+
+    elif action == "cancel":
+        # terminal: clear current owner (task is no longer in work)
+        task.assigned_to = None
+        task.assigned_at = None
+
+    # NOTE: 'unblock' does not touch assignment fields.
+    # NOTE: 'escalate' does not change status in FSM, but we still persist transition + bump row_version.
 
     task.status = to_status.value
     task.updated_at = _now()

@@ -5,9 +5,10 @@ import pytest
 from uuid import uuid4, UUID
 from datetime import datetime, timezone
 
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
+
 
 from app.models.task import Task, TaskStatus, FixSeverity
 from app.models.task_transition import TaskTransition
@@ -17,6 +18,22 @@ from app.fsm.task_fsm import TransitionNotAllowed
 from app.services.task_transition_service import apply_task_transition, VersionConflict, IdempotencyConflict
 
 
+
+def _pick_pt(db):
+    row = db.execute(text("SELECT id, org_id FROM project_templates LIMIT 1")).mappings().first()
+    assert row, "project_templates is empty in test DB"
+    return UUID(str(row["org_id"])), UUID(str(row["id"]))
+
+
+def _pick_existing_project_template(db: Session) -> tuple[UUID, UUID]:
+    row = db.execute(
+        text("SELECT id, org_id FROM project_templates LIMIT 1")
+    ).mappings().first()
+    if not row:
+        raise RuntimeError("project_templates is empty in test DB")
+    return UUID(str(row["org_id"])), UUID(str(row["id"]))
+
+
 def _make_task(
     db,
     *,
@@ -24,26 +41,38 @@ def _make_task(
     project_id=None,
     deliverable_id=None,
     created_by=None,
-    status=TaskStatus.new,
+    status=TaskStatus.blocked,
     row_version=1,
     title="T",
     description=None,
 ):
+
+# Ensure FK tasks.project_id -> project_templates.id always holds
+    if org_id is None or project_id is None:
+        org_db, pt_id = _pick_existing_project_template(db)
+        org_id = org_id or org_db
+        project_id = project_id or pt_id
+
+    # Safety assert: prevents silent FK failures
+    assert project_id is not None
+
+
     t = Task(
         id=uuid4(),
-        org_id=org_id or uuid4(),
-        project_id=project_id or uuid4(),
-        deliverable_id=deliverable_id,         # None допустим, но reject->fix-task потребует deliverable_id
+        org_id=org_id,
+        project_id=project_id,
+        deliverable_id=deliverable_id,
         title=title,
         description=description,
         status=status.value if isinstance(status, TaskStatus) else str(status),
-        created_by=created_by or uuid4(),      # ОБЯЗАТЕЛЬНОЕ поле
+        created_by=created_by or uuid4(),
         row_version=row_version,
     )
     db.add(t)
     db.flush()
     db.refresh(t)
     return t
+
 
 def _count_transitions(db, org_id, client_event_id):
     return db.execute(
@@ -55,7 +84,7 @@ def _count_transitions(db, org_id, client_event_id):
 
 
 def test_invariant_cannot_submit_from_new(db):
-    task = _make_task(db, status=TaskStatus.new, row_version=1)
+    task = _make_task(db, status=TaskStatus.blocked, row_version=1)
     actor = uuid4()
 
     with pytest.raises(TransitionNotAllowed):
@@ -71,12 +100,13 @@ def test_invariant_cannot_submit_from_new(db):
         )
 
     db.refresh(task)
-    assert task.status == TaskStatus.new.value
+    assert task.status == TaskStatus.blocked.value
     assert task.row_version == 1
 
 
 def test_fsm_negative_assign_requires_payload_assign_to(db):
-    task = _make_task(db, status=TaskStatus.new, row_version=1)
+    # assign is allowed only from pool (available). We keep payload empty to hit payload validation.
+    task = _make_task(db, status=TaskStatus.available, row_version=1)
     actor = uuid4()
 
     with pytest.raises(TransitionNotAllowed) as e:
@@ -117,7 +147,7 @@ def test_row_version_mismatch_rejected_and_state_unchanged(db):
 
 
 def test_invariant_cannot_assign_from_done(db):
-    task = _make_task(db, status=TaskStatus.new, row_version=1)
+    task = _make_task(db, status=TaskStatus.available, row_version=1)
     actor = uuid4()
     assignee = str(uuid4())
 
@@ -160,7 +190,7 @@ def test_invariant_cannot_assign_from_done(db):
         payload={},
         client_event_id=uuid4(),
     )
-    assert t3.status == TaskStatus.in_review.value
+    assert t3.status == TaskStatus.submitted.value
     assert t3.row_version == 4
 
     # in_review -> done (approve)
@@ -169,7 +199,7 @@ def test_invariant_cannot_assign_from_done(db):
         org_id=task.org_id,
         actor_user_id=actor,
         task_id=task.id,
-        action="approve",
+        action="review_approve",
         expected_row_version=4,
         payload={},
         client_event_id=uuid4(),
@@ -196,11 +226,11 @@ def test_invariant_cannot_assign_from_done(db):
 
 
 def test_reject_allowed_without_reason_when_deliverable_linked(db):
-    # ВАЖНО: текущий сервис требует deliverable_id для reject->create_fix_task
-    task = _make_task(db, status=TaskStatus.new, row_version=1, deliverable_id=uuid4())
+    # Service requires `reason` to create a fix-task on review_reject.
+    task = _make_task(db, status=TaskStatus.available, row_version=1, deliverable_id=uuid4())
     actor = uuid4()
 
-    # new -> assigned
+    # available -> assigned
     t1, _ = apply_task_transition(
         db,
         org_id=task.org_id,
@@ -237,28 +267,28 @@ def test_reject_allowed_without_reason_when_deliverable_linked(db):
         payload={},
         client_event_id=uuid4(),
     )
-    assert t3.status == TaskStatus.in_review.value
+    assert t3.status == TaskStatus.submitted.value
     assert t3.row_version == 4
 
-    # in_review -> rejected (даже без reason)
-    t4, fix_task = apply_task_transition(
-        db,
-        org_id=task.org_id,
-        actor_user_id=actor,
-        task_id=task.id,
-        action="reject",
-        expected_row_version=4,
-        payload={},  # reason пустой - по текущему FSM это ок
-        client_event_id=uuid4(),
-    )
-    assert t4.status == TaskStatus.rejected.value
-    assert t4.row_version == 5
-    assert fix_task is not None  # т.к. side_effect create_fix_task всегда создаётся
+    # submitted -> in_progress requires payload.reason
+    with pytest.raises(TransitionNotAllowed) as e:
+        apply_task_transition(
+            db,
+            org_id=task.org_id,
+            actor_user_id=actor,
+            task_id=task.id,
+            action="review_reject",
+            expected_row_version=4,
+            payload={"reason": "Need help"},
+            client_event_id=uuid4(),
+        )
+
+    assert "reason" in str(e.value).lower()
 
 
 def test_reject_requires_deliverable_link_in_service(db):
     # FSM разрешит reject, но сервис/side-effect запрещает создавать fix-task без deliverable_id
-    task = _make_task(db, status=TaskStatus.new, row_version=1, deliverable_id=None)
+    task = _make_task(db, status=TaskStatus.available, row_version=1, deliverable_id=None)
     actor = uuid4()
 
     # доводим до in_review
@@ -292,7 +322,7 @@ def test_reject_requires_deliverable_link_in_service(db):
         payload={},
         client_event_id=uuid4(),
     )
-    assert t3.status == TaskStatus.in_review.value
+    assert t3.status == TaskStatus.submitted.value
     assert t3.row_version == 4
 
     with pytest.raises(TransitionNotAllowed) as e:
@@ -301,9 +331,9 @@ def test_reject_requires_deliverable_link_in_service(db):
             org_id=task.org_id,
             actor_user_id=actor,
             task_id=task.id,
-            action="reject",
+            action="review_reject",
             expected_row_version=4,
-            payload={},
+            payload={"reason": "Need to fix"},
             client_event_id=uuid4(),
         )
 
@@ -312,7 +342,7 @@ def test_reject_requires_deliverable_link_in_service(db):
 
 
 def test_idempotency_same_client_event_id_no_duplicate_transition(db):
-    task = _make_task(db, status=TaskStatus.new, row_version=1)
+    task = _make_task(db, status=TaskStatus.available, row_version=1)
     actor = uuid4()
     assignee = str(uuid4())
     client_event_id = uuid4()
@@ -371,7 +401,7 @@ def test_idempotency_same_client_event_id_no_duplicate_transition(db):
 
 def test_idempotency_same_client_event_id_but_different_payload_is_rejected(db):
     # arrange
-    task = _make_task(db, status=TaskStatus.new, row_version=1)
+    task = _make_task(db, status=TaskStatus.available, row_version=1)
     actor = uuid4()
     client_event_id = uuid4()
 
@@ -417,7 +447,7 @@ def test_idempotency_same_client_event_id_but_different_payload_is_rejected(db):
     assert transitions_after == 1  # не задублилось
 
 
-def test_idempotency_race_unique_violation_returns_existing(db, monkeypatch, SessionLocal):
+def test_idempotency_race_unique_violation_returns_existing(db, monkeypatch):
     """
     Race simulation without patching flush (no hangs):
     - apply_task_transition does:
@@ -429,14 +459,17 @@ def test_idempotency_race_unique_violation_returns_existing(db, monkeypatch, Ses
     from uuid import uuid4
     from datetime import datetime, timezone
     from sqlalchemy import text, select, func
+    from sqlalchemy.orm import sessionmaker
 
     actor = uuid4()
     assignee = str(uuid4())
     client_event_id = uuid4()
 
     # create task in separate committed session so FK is not blocked
+    SessionLocal = sessionmaker(bind=db.get_bind())
+    session2 = SessionLocal()
     with SessionLocal() as s_setup:
-        task = _make_task(s_setup, status=TaskStatus.new, row_version=1)
+        task = _make_task(s_setup, status=TaskStatus.available, row_version=1)
         task_id = task.id
         org_id = task.org_id
         project_id = task.project_id
@@ -477,7 +510,7 @@ def test_idempotency_race_unique_violation_returns_existing(db, monkeypatch, Ses
                             "task_id": str(task_id),
                             "actor_user_id": str(actor),
                             "action": "assign",
-                            "from_status": TaskStatus.new.value,
+                            "from_status": TaskStatus.blocked.value,
                             "to_status": TaskStatus.assigned.value,
                             "payload": f'{{"assign_to":"{assignee}"}}',
                             "client_event_id": str(client_event_id),
@@ -531,7 +564,7 @@ def test_idempotency_reject_same_client_event_id_does_not_duplicate_fix_task(db)
     client_event_id = uuid4()
 
     # ВАЖНО: deliverable_id обязателен, иначе сервис запретит create_fix_task
-    task = _make_task(db, status=TaskStatus.new, row_version=1, deliverable_id=uuid4())
+    task = _make_task(db, status=TaskStatus.available, row_version=1, deliverable_id=uuid4())
 
     # new -> assigned
     t1, _ = apply_task_transition(
@@ -572,7 +605,7 @@ def test_idempotency_reject_same_client_event_id_does_not_duplicate_fix_task(db)
         payload={},
         client_event_id=uuid4(),
     )
-    assert t3.status == TaskStatus.in_review.value
+    assert t3.status == TaskStatus.submitted.value
     assert t3.row_version == 4
 
     # --- act #1: reject (creates fix task) ---
@@ -581,12 +614,12 @@ def test_idempotency_reject_same_client_event_id_does_not_duplicate_fix_task(db)
         org_id=task.org_id,
         actor_user_id=actor,
         task_id=task.id,
-        action="reject",
+        action="review_reject",
         expected_row_version=4,
-        payload={},  # reason optional by current FSM
+        payload={"reason": "Scratch on surface"},
         client_event_id=client_event_id,
     )
-    assert t4.status == TaskStatus.rejected.value
+    assert t4.status == TaskStatus.in_progress.value
     assert t4.row_version == 5
     assert fix1 is not None
     fix1_id = fix1.id
@@ -606,9 +639,9 @@ def test_idempotency_reject_same_client_event_id_does_not_duplicate_fix_task(db)
         org_id=task.org_id,
         actor_user_id=actor,
         task_id=task.id,
-        action="reject",
+        action="review_reject",
         expected_row_version=4,   # retry often повторяет тот же expected_row_version
-        payload={},
+        payload={"reason": "Scratch on surface"},
         client_event_id=client_event_id,
     )
 
@@ -643,7 +676,7 @@ def test_idempotency_reject_same_client_event_id_different_payload_conflict(db):
     actor = uuid4()
     client_event_id = uuid4()
 
-    task = _make_task(db, status=TaskStatus.new, row_version=1, deliverable_id=uuid4())
+    task = _make_task(db, status=TaskStatus.available, row_version=1, deliverable_id=uuid4())
 
     # new -> assigned
     t1, _ = apply_task_transition(
@@ -678,7 +711,7 @@ def test_idempotency_reject_same_client_event_id_different_payload_conflict(db):
         payload={},
         client_event_id=uuid4(),
     )
-    assert t3.status == TaskStatus.in_review.value
+    assert t3.status == TaskStatus.submitted.value
     assert t3.row_version == 4
 
     # act #1: reject payload A
@@ -687,12 +720,12 @@ def test_idempotency_reject_same_client_event_id_different_payload_conflict(db):
         org_id=task.org_id,
         actor_user_id=actor,
         task_id=task.id,
-        action="reject",
+        action="review_reject",
         expected_row_version=4,
         payload={"reason": "A"},  # payload A
         client_event_id=client_event_id,
     )
-    assert t4.status == TaskStatus.rejected.value
+    assert t4.status == TaskStatus.in_progress.value
     assert t4.row_version == 5
     assert fix1 is not None
 
@@ -703,7 +736,7 @@ def test_idempotency_reject_same_client_event_id_different_payload_conflict(db):
             org_id=task.org_id,
             actor_user_id=actor,
             task_id=task.id,
-            action="reject",
+            action="review_reject",
             expected_row_version=4,
             payload={"reason": "B"},  # payload mismatch
             client_event_id=client_event_id,
@@ -720,7 +753,7 @@ def test_idempotency_reject_same_client_event_id_different_payload_conflict(db):
 
     # assert: task unchanged после конфликта
     db.refresh(task)
-    assert task.status == TaskStatus.rejected.value
+    assert task.status == TaskStatus.in_progress.value
     assert task.row_version == 5
 
 
@@ -747,7 +780,7 @@ def test_idempotency_reject_same_client_event_id_but_different_reason_is_conflic
     # reject -> create_fix_task требует deliverable_id
     task = _make_task(
         db,
-        status=TaskStatus.new,
+        status=TaskStatus.available,
         row_version=1,
         deliverable_id=uuid4(),
     )
@@ -787,7 +820,7 @@ def test_idempotency_reject_same_client_event_id_but_different_reason_is_conflic
     )
 
     db.refresh(task)
-    assert task.status == TaskStatus.in_review.value
+    assert task.status == TaskStatus.submitted.value
     assert task.row_version == 4
 
     # --- act 1: первый reject ---
@@ -796,13 +829,13 @@ def test_idempotency_reject_same_client_event_id_but_different_reason_is_conflic
         org_id=task.org_id,
         actor_user_id=actor,
         task_id=task.id,
-        action="reject",
+        action="review_reject",
         expected_row_version=4,
         payload={"reason": "bad quality"},
         client_event_id=client_event_id,
     )
 
-    assert t1.status == TaskStatus.rejected.value
+    assert t1.status == TaskStatus.in_progress.value
     assert fix1 is not None
 
     fix_task_id = fix1.id
@@ -815,7 +848,7 @@ def test_idempotency_reject_same_client_event_id_but_different_reason_is_conflic
             org_id=task.org_id,
             actor_user_id=actor,
             task_id=task.id,
-            action="reject",
+            action="review_reject",
             expected_row_version=4,
             payload={"reason": "wrong dimensions"},  # <-- отличие здесь
             client_event_id=client_event_id,
@@ -823,7 +856,7 @@ def test_idempotency_reject_same_client_event_id_but_different_reason_is_conflic
 
     # --- assert: ничего не изменилось ---
     db.refresh(task)
-    assert task.status == TaskStatus.rejected.value
+    assert task.status == TaskStatus.in_progress.value
     assert task.row_version == row_version_after_first
 
     # fix-task не задублился
@@ -861,7 +894,7 @@ def test_idempotency_reject_same_client_event_id_but_different_fix_title_is_conf
     client_event_id = uuid4()
 
     # reject -> fix-task requires deliverable_id
-    task = _make_task(db, status=TaskStatus.new, row_version=1, deliverable_id=uuid4())
+    task = _make_task(db, status=TaskStatus.available, row_version=1, deliverable_id=uuid4())
 
     # доводим до in_review
     apply_task_transition(
@@ -881,16 +914,16 @@ def test_idempotency_reject_same_client_event_id_but_different_fix_title_is_conf
     )
 
     db.refresh(task)
-    assert task.status == TaskStatus.in_review.value
+    assert task.status == TaskStatus.submitted.value
     assert task.row_version == 4
 
     # act1: first reject
     t1, fix1 = apply_task_transition(
         db, org_id=task.org_id, actor_user_id=actor, task_id=task.id,
-        action="reject", expected_row_version=4,
-        payload={"fix_title": "Fix A"}, client_event_id=client_event_id,
+        action="review_reject", expected_row_version=4,
+        payload={"reason": "bad quality", "fix_title": "Fix A"}, client_event_id=client_event_id,
     )
-    assert t1.status == TaskStatus.rejected.value
+    assert t1.status == TaskStatus.in_progress.value
     assert fix1 is not None
     row_version_after_first = t1.row_version
 
@@ -898,14 +931,14 @@ def test_idempotency_reject_same_client_event_id_but_different_fix_title_is_conf
     with pytest.raises(IdempotencyConflict):
         apply_task_transition(
             db, org_id=task.org_id, actor_user_id=actor, task_id=task.id,
-            action="reject", expected_row_version=4,
-            payload={"fix_title": "Fix B"},  # <-- mismatch here
+            action="review_reject", expected_row_version=4,
+            payload={"reason": "bad quality", "fix_title": "Fix B"},  # <-- mismatch here
             client_event_id=client_event_id,
         )
 
     # assert: no additional side effects
     db.refresh(task)
-    assert task.status == TaskStatus.rejected.value
+    assert task.status == TaskStatus.in_progress.value
     assert task.row_version == row_version_after_first
 
     # only 1 fix-task for origin_task_id
@@ -940,7 +973,7 @@ def test_idempotency_reject_same_client_event_id_but_different_severity_is_confl
     actor = uuid4()
     client_event_id = uuid4()
 
-    task = _make_task(db, status=TaskStatus.new, row_version=1, deliverable_id=uuid4())
+    task = _make_task(db, status=TaskStatus.available, row_version=1, deliverable_id=uuid4())
 
     # доводим до in_review
     apply_task_transition(
@@ -960,16 +993,16 @@ def test_idempotency_reject_same_client_event_id_but_different_severity_is_confl
     )
 
     db.refresh(task)
-    assert task.status == TaskStatus.in_review.value
+    assert task.status == TaskStatus.submitted.value
     assert task.row_version == 4
 
     # act1: first reject
     t1, fix1 = apply_task_transition(
         db, org_id=task.org_id, actor_user_id=actor, task_id=task.id,
-        action="reject", expected_row_version=4,
-        payload={"severity": "major"}, client_event_id=client_event_id,
+        action="review_reject", expected_row_version=4,
+        payload={"reason": "bad", "severity": "major"}, client_event_id=client_event_id,
     )
-    assert t1.status == TaskStatus.rejected.value
+    assert t1.status == TaskStatus.in_progress.value
     assert fix1 is not None
     row_version_after_first = t1.row_version
 
@@ -977,14 +1010,14 @@ def test_idempotency_reject_same_client_event_id_but_different_severity_is_confl
     with pytest.raises(IdempotencyConflict):
         apply_task_transition(
             db, org_id=task.org_id, actor_user_id=actor, task_id=task.id,
-            action="reject", expected_row_version=4,
-            payload={"severity": "critical"},  # <-- mismatch here
+            action="review_reject", expected_row_version=4,
+            payload={"reason": "bad", "severity": "critical"},  # <-- mismatch here
             client_event_id=client_event_id,
         )
 
     # assert: no additional side effects
     db.refresh(task)
-    assert task.status == TaskStatus.rejected.value
+    assert task.status == TaskStatus.in_progress.value
     assert task.row_version == row_version_after_first
 
     fix_tasks = db.scalar(
@@ -1006,7 +1039,7 @@ def test_idempotency_reject_severity_enum_vs_string_is_same_request(db):
     Проверяем семантическую эквивалентность payload:
     severity=FixSeverity.major и severity="major" должны считаться одним запросом.
     """
-    task = _make_task(db, status=TaskStatus.new, row_version=1, deliverable_id=uuid4())
+    task = _make_task(db, status=TaskStatus.available, row_version=1, deliverable_id=uuid4())
     actor = uuid4()
     client_event_id = uuid4()
 
@@ -1033,12 +1066,12 @@ def test_idempotency_reject_severity_enum_vs_string_is_same_request(db):
         org_id=task.org_id,
         actor_user_id=actor,
         task_id=task.id,
-        action="reject",
+        action="review_reject",
         expected_row_version=4,
         payload={"reason": "bad", "severity": FixSeverity.major},
         client_event_id=client_event_id,
     )
-    assert t1.status == TaskStatus.rejected.value
+    assert t1.status == TaskStatus.in_progress.value
     assert fix1 is not None
 
     # 2) replay same client_event_id but severity as string
@@ -1047,7 +1080,7 @@ def test_idempotency_reject_severity_enum_vs_string_is_same_request(db):
         org_id=task.org_id,
         actor_user_id=actor,
         task_id=task.id,
-        action="reject",
+        action="review_reject",
         expected_row_version=4,
         payload={"reason": "bad", "severity": "major"},
         client_event_id=client_event_id,
@@ -1064,7 +1097,7 @@ def test_idempotency_assign_uuid_vs_string_is_same_request(db):
     """
     assign_to: UUID(...) и str(UUID) должны считаться одним запросом для idempotency.
     """
-    task = _make_task(db, status=TaskStatus.new, row_version=1)
+    task = _make_task(db, status=TaskStatus.available, row_version=1)
     actor = uuid4()
     client_event_id = uuid4()
 

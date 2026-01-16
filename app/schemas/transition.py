@@ -1,28 +1,24 @@
 # app/schemas/transition.py
 from __future__ import annotations
 
-from typing import Annotated, Literal, Optional, Union, Any
+from typing import Annotated, Literal, Optional, Union
 from uuid import UUID
-from datetime import datetime
+
 from pydantic import BaseModel, Field, conint
 
 
 # ============================================================================
-# PAYLOAD MODELS (строго под action из task_fsm.py)
+# PAYLOAD MODELS (strictly per actions in app/fsm/task_fsm.py)
 # ============================================================================
 
+
 class EmptyPayload(BaseModel):
-    """
-    Payload для действий, где тело не требуется:
-    plan, unassign, start, submit, approve, cancel
-    """
-    pass
+    """Payload for actions where body is not required."""
 
 
 class AssignPayload(BaseModel):
-    """
-    Payload для action=assign: назначить исполнителя.
-    """
+    """Payload for action=assign (leader assigns executor)."""
+
     assign_to: UUID = Field(
         ...,
         description="User ID исполнителя",
@@ -30,13 +26,13 @@ class AssignPayload(BaseModel):
     )
 
 
-class RejectPayload(BaseModel):
-    """
-    Payload для action=reject: отклонить задачу и (опционально) создать fix-task.
+class ReviewRejectPayload(BaseModel):
+    """Payload for action=review_reject.
 
-    ВАЖНО: reject всегда переводит в status=rejected (зафиксировано в FSM).
-    Возврат в работу происходит через создание fix-task (side-effect FSM).
+    Возвращает задачу в работу (submitted -> in_progress). Опционально может породить fix-task
+    (через side-effect сервиса).
     """
+
     reason: str = Field(
         ...,
         min_length=1,
@@ -55,14 +51,23 @@ class RejectPayload(BaseModel):
     )
 
 
+class EscalatePayload(BaseModel):
+    """Payload for action=escalate (no status change)."""
+
+    message: str = Field(
+        ...,
+        min_length=1,
+        description="Сообщение/сигнал лиду: нужна помощь/переназначение",
+        examples=["Нужна помощь: нет инструмента/не уверен в операции"],
+    )
+
+
 # ============================================================================
 # COMMON REQUEST FIELDS
 # ============================================================================
 
+
 class TransitionCommon(BaseModel):
-    """
-    Общие поля для всех transition requests.
-    """
     org_id: UUID = Field(
         ...,
         description="Организация (мультитенантность). Пока передаём явно, позже будет из auth.",
@@ -80,7 +85,7 @@ class TransitionCommon(BaseModel):
     )
     client_event_id: Optional[UUID] = Field(
         None,
-        description="Idempotency key (UUID). Опционально. Повтор с тем же значением не даёт побочный эффект.",
+        description="Idempotency key (UUID). Опционально.",
         examples=["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"],
     )
 
@@ -88,112 +93,102 @@ class TransitionCommon(BaseModel):
 # ============================================================================
 # ACTION-SPECIFIC REQUEST MODELS (discriminator = action)
 # ============================================================================
-# Все actions из task_fsm.py:
-# PLAN, ASSIGN, UNASSIGN, START, SUBMIT, APPROVE, REJECT, CANCEL
 
-class PlanRequest(TransitionCommon):
-    """
-    Action: plan
-    Переход: new -> planned
-    Payload: пустой
-    """
-    action: Literal["plan"] = "plan"
+
+class UnblockRequest(TransitionCommon):
+    """Action: unblock (blocked -> available)."""
+
+    action: Literal["unblock"] = "unblock"
+    payload: EmptyPayload = Field(default_factory=EmptyPayload)
+
+
+class SelfAssignRequest(TransitionCommon):
+    """Action: self_assign (available -> assigned)."""
+
+    action: Literal["self_assign"] = "self_assign"
     payload: EmptyPayload = Field(default_factory=EmptyPayload)
 
 
 class AssignRequest(TransitionCommon):
-    """
-    Action: assign
-    Переход: new/planned -> assigned
-    Payload: {assign_to: UUID}
-    """
+    """Action: assign (available -> assigned)."""
+
     action: Literal["assign"] = "assign"
     payload: AssignPayload
 
 
-class UnassignRequest(TransitionCommon):
-    """
-    Action: unassign
-    Переход: assigned -> planned
-    Payload: пустой
-    """
-    action: Literal["unassign"] = "unassign"
-    payload: EmptyPayload = Field(default_factory=EmptyPayload)
-
-
 class StartRequest(TransitionCommon):
-    """
-    Action: start
-    Переход: assigned -> in_progress
-    Payload: пустой
-    """
+    """Action: start (assigned -> in_progress)."""
+
     action: Literal["start"] = "start"
     payload: EmptyPayload = Field(default_factory=EmptyPayload)
 
 
 class SubmitRequest(TransitionCommon):
-    """
-    Action: submit
-    Переход: in_progress -> in_review
-    Payload: пустой
-    """
+    """Action: submit (in_progress -> submitted)."""
+
     action: Literal["submit"] = "submit"
     payload: EmptyPayload = Field(default_factory=EmptyPayload)
 
 
-class ApproveRequest(TransitionCommon):
-    """
-    Action: approve
-    Переход: in_review -> done
-    Payload: пустой
-    """
-    action: Literal["approve"] = "approve"
+class ReviewApproveRequest(TransitionCommon):
+    """Action: review_approve (submitted -> done)."""
+
+    action: Literal["review_approve"] = "review_approve"
     payload: EmptyPayload = Field(default_factory=EmptyPayload)
 
 
-class RejectRequest(TransitionCommon):
-    """
-    Action: reject
-    Переход: in_review -> rejected
-    Payload: {reason, fix_title?, assign_to?}
-    Side-effect: создаёт fix-task
-    """
-    action: Literal["reject"] = "reject"
-    payload: RejectPayload
+class ReviewRejectRequest(TransitionCommon):
+    """Action: review_reject (submitted -> in_progress)."""
+
+    action: Literal["review_reject"] = "review_reject"
+    payload: ReviewRejectPayload
+
+
+class ShiftReleaseRequest(TransitionCommon):
+    """Action: shift_release (assigned/in_progress -> available)."""
+
+    action: Literal["shift_release"] = "shift_release"
+    payload: EmptyPayload = Field(default_factory=EmptyPayload)
+
+
+class RecallToPoolRequest(TransitionCommon):
+    """Action: recall_to_pool (assigned/in_progress -> available)."""
+
+    action: Literal["recall_to_pool"] = "recall_to_pool"
+    payload: EmptyPayload = Field(default_factory=EmptyPayload)
+
+
+class EscalateRequest(TransitionCommon):
+    """Action: escalate (no status change)."""
+
+    action: Literal["escalate"] = "escalate"
+    payload: EscalatePayload
 
 
 class CancelRequest(TransitionCommon):
-    """
-    Action: cancel
-    Переход: любой нефинальный -> canceled
-    Payload: пустой
-    """
+    """Action: cancel (any non-terminal -> canceled)."""
+
     action: Literal["cancel"] = "cancel"
     payload: EmptyPayload = Field(default_factory=EmptyPayload)
 
 
-# ============================================================================
-# DISCRIMINATED UNION
-# ============================================================================
-
 TaskTransitionRequest = Annotated[
     Union[
-        PlanRequest,
+        UnblockRequest,
+        SelfAssignRequest,
         AssignRequest,
-        UnassignRequest,
         StartRequest,
         SubmitRequest,
-        ApproveRequest,
-        RejectRequest,
+        ReviewApproveRequest,
+        ReviewRejectRequest,
+        ShiftReleaseRequest,
+        RecallToPoolRequest,
+        EscalateRequest,
         CancelRequest,
     ],
     Field(discriminator="action"),
 ]
 
-
-# ============================================================================
-# RESPONSE MODELS
-# ============================================================================
 
 class TaskTransitionResponse(BaseModel):
     task_id: UUID
@@ -202,26 +197,13 @@ class TaskTransitionResponse(BaseModel):
     fix_task_id: Optional[UUID] = None
 
 
-# ============================================================================
-# LEGACY COMPATIBILITY (если нужно для других частей API)
-# ============================================================================
-# Если где-то используется старый TaskTransitionItem, оставляем для совместимости
-
-from datetime import datetime
-from typing import Any
-
-
 class TaskTransitionItem(BaseModel):
-    """
-    Модель для чтения истории transitions (GET /tasks/{id}/transitions).
-    """
+    """Модель для чтения истории transitions (GET /tasks/{id}/transitions)."""
+
     id: UUID
     task_id: UUID
-    action: str  # не enum, т.к. из БД приходит строка
+    action: str
     from_status: str
     to_status: str
-    payload: dict[str, Any]  # исторический payload, не типизированный
-    actor_user_id: UUID
-    created_at: datetime
-
-    model_config = {"from_attributes": True}
+    created_at: Optional[str] = None
+    payload: Optional[dict] = None

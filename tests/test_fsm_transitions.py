@@ -20,18 +20,63 @@ from app.services.task_transition_service import apply_task_transition, VersionC
 
 
 def _pick_pt(db):
-    row = db.execute(text("SELECT id, org_id FROM project_templates LIMIT 1")).mappings().first()
+    # NB: In current DB schema, tasks.project_id FK references project_templates.project_id (NOT project_templates.id)
+    row = db.execute(text("SELECT project_id, org_id FROM project_templates LIMIT 1")).mappings().first()
     assert row, "project_templates is empty in test DB"
-    return UUID(str(row["org_id"])), UUID(str(row["id"]))
+    return UUID(str(row["org_id"])), UUID(str(row["project_id"]))
 
 
 def _pick_existing_project_template(db: Session) -> tuple[UUID, UUID]:
     row = db.execute(
-        text("SELECT id, org_id FROM project_templates LIMIT 1")
+        text("SELECT project_id, org_id FROM project_templates LIMIT 1")
     ).mappings().first()
     if not row:
         raise RuntimeError("project_templates is empty in test DB")
-    return UUID(str(row["org_id"])), UUID(str(row["id"]))
+    return UUID(str(row["org_id"])), UUID(str(row["project_id"]))
+
+
+def _ensure_deliverable_exists(db, *, deliverable_id, org_id, project_id, created_by):
+    """If tests attach deliverable_id to a Task, ensure Deliverable row exists.
+
+    This avoids service-level failures when Task is linked to a non-existent deliverable.
+    The DB schema requires several NOT NULL fields on deliverables.
+    """
+    if deliverable_id is None:
+        return
+
+    exists = db.execute(
+        text("select 1 from deliverables where org_id=:org_id and id=:id"),
+        {"org_id": org_id, "id": deliverable_id},
+    ).first()
+    if exists:
+        return
+
+    db.execute(
+        text(
+            """
+            insert into deliverables (
+                id, org_id, project_id,
+                deliverable_type, serial, status,
+                created_by
+            ) values (
+                :id, :org_id, :project_id,
+                :deliverable_type, :serial, :status,
+                :created_by
+            )
+            """
+        ),
+        {
+            "id": deliverable_id,
+            "org_id": org_id,
+            # IMPORTANT: deliverables.project_id FK references project_templates.project_id
+            "project_id": project_id,
+            "deliverable_type": "box",
+            # uq_deliverables_org_serial => must be unique within org
+            "serial": f"test-{uuid4().hex}",
+            "status": "in_progress",
+            "created_by": created_by,
+        },
+    )
 
 
 def _make_task(
@@ -41,13 +86,15 @@ def _make_task(
     project_id=None,
     deliverable_id=None,
     created_by=None,
-    status=TaskStatus.blocked,
+    # Pool Architecture default: tasks are typically created ready-to-work unless a test
+    # explicitly needs a blocked state.
+    status=TaskStatus.available,
     row_version=1,
     title="T",
     description=None,
 ):
 
-# Ensure FK tasks.project_id -> project_templates.id always holds
+    # Ensure FK tasks.project_id -> project_templates.project_id always holds
     if org_id is None or project_id is None:
         org_db, pt_id = _pick_existing_project_template(db)
         org_id = org_id or org_db
@@ -57,6 +104,16 @@ def _make_task(
     assert project_id is not None
 
 
+    created_by = created_by or uuid4()
+
+    _ensure_deliverable_exists(
+        db,
+        deliverable_id=deliverable_id,
+        org_id=org_id,
+        project_id=project_id,
+        created_by=created_by,
+    )
+
     t = Task(
         id=uuid4(),
         org_id=org_id,
@@ -65,7 +122,7 @@ def _make_task(
         title=title,
         description=description,
         status=status.value if isinstance(status, TaskStatus) else str(status),
-        created_by=created_by or uuid4(),
+        created_by=created_by,
         row_version=row_version,
     )
     db.add(t)
@@ -83,7 +140,7 @@ def _count_transitions(db, org_id, client_event_id):
     ).scalar_one()
 
 
-def test_invariant_cannot_submit_from_new(db):
+def test_invariant_cannot_submit_from_blocked(db):
     task = _make_task(db, status=TaskStatus.blocked, row_version=1)
     actor = uuid4()
 

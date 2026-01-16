@@ -1,10 +1,15 @@
 docker exec -it planner_postgres psql -U planner -d planner -c "
-SELECT queryid, calls, rows,
-       left(regexp_replace(query, '\s+', ' ', 'g'), 300) AS q
-FROM pg_stat_statements
-WHERE query ILIKE '%FROM tasks%'
-ORDER BY total_exec_time DESC
-LIMIT 50;
+select tablename
+from pg_tables
+where schemaname='public'
+  and tablename ilike '%template%'
+order by tablename;
+
+select tablename
+from pg_tables
+where schemaname='public'
+  and tablename ilike '%version%'
+order by tablename;
 
 "
 

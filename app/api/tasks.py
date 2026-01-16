@@ -20,6 +20,7 @@ from app.schemas.task_event import TaskEventRead
 from app.schemas.transition import TaskTransitionRequest, TaskTransitionResponse, TaskTransitionItem
 from app.schemas.command import Command
 from app.schemas.fix_task import ReportFixPayload
+from app.schemas.error import ErrorResponse
 
 from app.models.task import Task, TaskStatus, WorkKind
 from app.models.task_event import TaskEvent
@@ -170,16 +171,24 @@ def create_task(data: TaskCreate, db: Session = Depends(get_db)):
     return task
 
 
-@router.post("/{task_id}/transitions",
-            response_model=TaskTransitionResponse,
-            response_model_exclude_none=True,
-            summary="Apply FSM transition to task",
-            description=(
-                "Применяет действие FSM к задаче (например: plan/assign/start/submit/approve/reject).\n\n"
-                "Требует optimistic lock: expected_row_version должен совпадать с текущим row_version задачи.\n"
-                "payload зависит от action (см. примеры в Swagger)."
-                ),
-            )
+@router.post(
+    "/{task_id}/transitions",
+    response_model=TaskTransitionResponse,
+    response_model_exclude_none=True,
+    summary="Apply FSM transition to task",
+    description=(
+        "Применяет действие FSM к задаче (например: plan/assign/start/submit/approve/reject).\n\n"
+        "Требует optimistic lock: expected_row_version должен совпадать с текущим row_version задачи.\n"
+        "payload зависит от action (см. примеры в Swagger)."
+    ),
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized (missing or invalid auth headers)"},
+        403: {"model": ErrorResponse, "description": "Forbidden (RBAC: action not allowed for this role)"},
+        404: {"model": ErrorResponse, "description": "Task not found"},
+        409: {"model": ErrorResponse, "description": "Conflict (row_version mismatch or idempotency conflict)"},
+        422: {"model": ErrorResponse, "description": "FSM validation error / blocked / invalid transition"},
+    },
+)
 def transition_task(
     task_id: UUID,
     payload: TaskTransitionRequest = Body(..., openapi_examples=TASK_TRANSITION_OPENAPI_EXAMPLES),
@@ -187,6 +196,7 @@ def transition_task(
     db: Session = Depends(get_db),
 ):
     # --- Guard: QC actions are not allowed in Task FSM (Variant A) ---
+    # TODO(qc): move QC actions to separate router / FSM
     if payload.action.startswith("qc_"):
         raise HTTPException(
             status_code=422,

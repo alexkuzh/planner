@@ -13,7 +13,7 @@ from app.core.config import settings
 
 app = FastAPI(title=settings.app_name)
 
-OPEN_PATHS = {"/docs", "/openapi.json", "/redoc", "/favicon.ico"}
+OPEN_PATHS = {"/docs", "/openapi.json", "/redoc", "/favicon.ico", "/health"}
 
 @app.middleware("http")
 async def require_x_role(request: Request, call_next):

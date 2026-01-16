@@ -41,7 +41,11 @@ class DeliverableBootstrapRequest(BaseModel):
         description="Проект. Пока передаём явно, позже будет из auth/context.",
         examples=["22222222-2222-2222-2222-222222222222"],
     )
-
+    actor_user_id: UUID = Field(
+        ...,
+        description="Пользователь, инициирующий bootstrap (audit / ownership).",
+        examples=["33333333-3333-3333-3333-333333333333"],
+    )
     model_config = {
         "json_schema_extra": {
             "examples": [

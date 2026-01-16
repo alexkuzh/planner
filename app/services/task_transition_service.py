@@ -281,7 +281,7 @@ def apply_task_transition(
 
     # 7) ТОЛЬКО если transition реально вставился — применяем изменения к Task
     if action == "assign":
-        assign_to = payload.get("assign_to") or payload.get("user_id")
+        assign_to = payload_norm.get("assign_to") or payload_norm.get("user_id")
         if not assign_to:
             raise TransitionNotAllowed("Action 'assign' требует payload.assign_to (user_id).")
         task.assigned_to = UUID(str(assign_to))

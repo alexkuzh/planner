@@ -524,6 +524,7 @@ def bootstrap_deliverable(
                 org_id=body.org_id,
                 project_id=body.project_id,
                 deliverable_id=deliverable_id,
+                actor_user_id=body.actor_user_id,
             )
     except BootstrapError as e:
         raise HTTPException(status_code=422, detail=str(e))

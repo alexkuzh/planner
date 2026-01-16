@@ -7,7 +7,12 @@ from fastapi import Header, HTTPException, status
 
 
 def get_current_user_id(
-    x_actor_user_id: str | None = Header(default=None, alias="X-Actor-User-Id"),
+        x_actor_user_id: str | None = Header(
+            default=None,
+            alias="X-Actor-User-Id",
+            description="UUID пользователя, выполняющего действие. Временная auth для MVP.",
+            examples=["33333333-3333-3333-3333-333333333333"],
+        ),
 ) -> UUID:
     """
     Временная авторизация для MVP:
@@ -28,16 +33,36 @@ def get_current_user_id(
         )
 
 
-def get_actor_role(x_role: str | None = Header(default=None, alias="X-Role")) -> str:
-    if not x_role or not x_role.strip():
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing X-Role header",
+# TODO(auth): убрать default role после внедрения auth middleware
+def get_actor_role(
+        x_role: str = Header(
+            "system",
+            alias="X-Role",
+            description=(
+                    "RBAC роль пользователя. "
+                    "MVP default = system. "
+                    "В production будет извлекаться из auth context."
+            ),
+            examples=["system", "lead", "executor"],
         )
+) -> str:
+    """
+    Извлекает роль пользователя из заголовка X-Role.
+
+    MVP: дефолт = 'system' для удобства тестирования.
+    Production: будет извлекаться из JWT/session после внедрения auth middleware.
+    """
     return x_role.strip()
 
 
-def get_actor_role_optional(x_role: str | None = Header(default=None, alias="X-Role")) -> str | None:
+def get_actor_role_optional(
+        x_role: str | None = Header(
+            default=None,
+            alias="X-Role",
+            description="RBAC роль пользователя (опционально для публичных endpoint).",
+            examples=["system", "lead", "executor"],
+        )
+) -> str | None:
     """
     For public/read-only endpoints: role may be omitted.
     """

@@ -33,7 +33,9 @@ class TaskKind(str, enum.Enum):
     maintenance = "maintenance"
     admin = "admin"
     other = "other"
-
+    # MVP / template-driven
+    work = "work"
+    qc = "qc"
 
 class WorkKind(str, enum.Enum):
     """Тип работы: обычная работа или исправление (fix-task)."""

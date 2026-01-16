@@ -157,7 +157,7 @@ class TaskFixService:
             created_by=actor_user_id,
             title=title,
             description=description,
-            status=TaskStatus.new.value,
+            status=TaskStatus.available.value,
             kind=TaskKind.production.value,  # единый дефолт для fix в MVP
             work_kind=WorkKind.fix,
             parent_task_id=None,

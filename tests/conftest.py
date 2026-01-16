@@ -1,58 +1,57 @@
-import os
 import pytest
 from sqlalchemy import create_engine, event
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker as _sessionmaker
 
-# --- TEST DATABASE URL ---
-TEST_DATABASE_URL = os.getenv(
-    "TEST_DATABASE_URL",
-    "postgresql+psycopg://planner:planner@localhost:5432/planner_test",
-)
-
-# ВАЖНО: якорим settings приложения (если где-то используются)
-os.environ.setdefault("DATABASE_URL", TEST_DATABASE_URL)
-os.environ.setdefault("DATABASE_DSN", TEST_DATABASE_URL)
-os.environ.setdefault("SQLALCHEMY_DATABASE_URI", TEST_DATABASE_URL)
-
-# ⚠️ ОБЯЗАТЕЛЬНО: регистрируем таблицу qc_inspections в metadata
-import app.models.qc_inspection  # noqa: F401
-import app.models
+from app.core.config import settings
 
 
-# --- ENGINE ---
 @pytest.fixture(scope="session")
 def engine():
-    return create_engine(
-        TEST_DATABASE_URL,
-        isolation_level="READ COMMITTED",
-        pool_pre_ping=True,
+    # ВАЖНО: в проекте это свойство называется database_url
+    return create_engine(settings.database_url)
+
+
+@pytest.fixture(scope="session")
+def sessionmaker(engine):
+    return _sessionmaker(
+        bind=engine,
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
     )
 
 
-# --- DB SESSION (nested transaction per test) ---
 @pytest.fixture()
 def db(engine):
+    """
+    Isolation pattern:
+      - connection.begin() outer transaction per test
+      - session.begin_nested() SAVEPOINT, so IntegrityError doesn't poison whole test
+    Teardown:
+      - rollback outer transaction (always safe, no 'deassociated' warnings)
+    """
     connection = engine.connect()
-    transaction = connection.begin()  # outer transaction
+    outer = connection.begin()
 
-    SessionLocal = sessionmaker(
+    Session = _sessionmaker(
         bind=connection,
         autoflush=False,
         autocommit=False,
+        expire_on_commit=False,
     )
-    session = SessionLocal()
+    session = Session()
 
-    # SAVEPOINT — ключевая часть
     session.begin_nested()
 
     @event.listens_for(session, "after_transaction_end")
     def restart_savepoint(sess, trans):
-        if trans.nested and not trans._parent.nested:
+        if trans.nested and not sess.in_nested_transaction():
             sess.begin_nested()
 
     try:
         yield session
     finally:
         session.close()
-        transaction.rollback()
+        if outer.is_active:
+            outer.rollback()
         connection.close()

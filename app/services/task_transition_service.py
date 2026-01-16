@@ -15,6 +15,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.models.task import Task, TaskStatus, FixSeverity, FixSource
 from app.models.task_transition import TaskTransition
+from app.models.qc_inspection import QcInspection, QcResult
 from app.fsm.task_fsm import apply_transition, TransitionNotAllowed
 from app.services.task_fix_service import TaskFixService
 
@@ -64,19 +65,12 @@ def _same_request(
     actor_user_id: UUID,
     action: str,
     expected_row_version: int,
-    payload: dict[str, Any],
+    payload: dict,
 ) -> bool:
-    # NOTE: для idempotency сравниваем НОРМАЛИЗОВАННЫЕ payload,
-    # чтобы UUID/Enum/пробелы не давали ложный конфликт.
-    existing_payload_norm = _normalize_payload_for_idempotency(action, existing.payload or {})
-    incoming_payload_norm = _normalize_payload_for_idempotency(action, payload or {})
-
     return (
         existing.task_id == task_id
         and existing.actor_user_id == actor_user_id
         and existing.action == action
-        and existing.expected_row_version == expected_row_version
-        and _canon(existing_payload_norm) == _canon(incoming_payload_norm)
     )
 
 def _to_uuid_str(value: Any) -> Any:
@@ -186,34 +180,35 @@ def apply_task_transition(
     expected_row_version: int,
     payload: dict,
     client_event_id: UUID | None,
-    ) -> tuple[Task, Task | None]:
+) -> tuple[Task, Task | None]:
     payload = payload or {}
 
     # NOTE: нормализуем payload для:
     # 1) строгого idempotency-сравнения по смыслу
     # 2) стабильного хранения payload в task_transitions
-
     payload_norm = _normalize_payload_for_idempotency(action, payload)
 
-    # 0) Idempotency (strict)
+    # 0) Idempotency (strict) — SCOPE: (task_id, client_event_id)
     if client_event_id is not None:
         existing = db.execute(
             select(TaskTransition).where(
-                TaskTransition.org_id == org_id,
+                TaskTransition.task_id == task_id,
                 TaskTransition.client_event_id == client_event_id,
             )
         ).scalar_one_or_none()
 
         if existing is not None:
             if not _same_request(
-                    existing,
-                    task_id=task_id,
-                    actor_user_id=actor_user_id,
-                    action=action,
-                    expected_row_version=expected_row_version,
-                    payload=payload_norm,
+                existing,
+                task_id=task_id,
+                actor_user_id=actor_user_id,
+                action=action,
+                expected_row_version=expected_row_version,
+                payload=payload_norm,
             ):
-                raise IdempotencyConflict("client_event_id already used with different request data")
+                raise IdempotencyConflict(
+                    "client_event_id already used with different request data"
+                )
 
             return _load_result_by_transition(db, existing)
 
@@ -227,13 +222,13 @@ def apply_task_transition(
 
     # 2) Optimistic lock
     if task.row_version != expected_row_version:
-        raise VersionConflict(f"Expected row_version={expected_row_version}, actual={task.row_version}")
+        raise VersionConflict(
+            f"Expected row_version={expected_row_version}, actual={task.row_version}"
+        )
 
     from_status = TaskStatus(task.status) if isinstance(task.status, str) else task.status
 
-
     # 3) FSM (но Task пока НЕ меняем)
-    # Дополнительные инварианты/предохранители уровня сервиса.
     if action == "unblock" and task.assigned_to is not None:
         raise TransitionNotAllowed("Cannot unblock: task is assigned")
 
@@ -243,20 +238,34 @@ def apply_task_transition(
     tr_payload = dict(payload_norm)
     fix_task: Task | None = None
 
-    # 5) Side effects (reject => create fix-task) — может добавить fix_task_id в payload
+    # 5) Side effects (reject => create fix-task)
     for eff in side_effects:
         if eff.kind == FIX_EFFECT_CREATE:
-            # REVIEW_REJECT policy: фиксируем, что исправить и что исправлено.
-            # Для MVP требуем хотя бы `reason` (что исправить).
             reason = (eff.payload.get("reason") or "").strip()
             fix_title = (eff.payload.get("fix_title") or "").strip()
             severity = _parse_severity(eff.payload.get("severity"))
 
             if not reason:
-                raise TransitionNotAllowed("Action 'review_reject' requires payload.reason (what to fix).")
+                raise TransitionNotAllowed(
+                    "Action 'review_reject' requires payload.reason (what to fix)."
+                )
 
             if task.deliverable_id is None:
-                raise TransitionNotAllowed("Cannot create fix-task: task is not linked to deliverable_id")
+                raise TransitionNotAllowed(
+                    "Cannot create fix-task: task is not linked to deliverable_id"
+                )
+
+            qc = QcInspection(
+                org_id=task.org_id,
+                project_id=task.project_id,
+                deliverable_id=task.deliverable_id,
+                inspector_user_id=actor_user_id,
+                responsible_user_id=None,
+                result=QcResult.rejected.value,
+                notes=reason,
+            )
+            db.add(qc)
+            db.flush()  # need qc.id for fix-task
 
             svc = TaskFixService(db)
             fix_task = svc.create_fix(
@@ -266,11 +275,11 @@ def apply_task_transition(
                 actor_user_id=actor_user_id,
                 title=fix_title or f"Fix: {task.title}",
                 description=reason,
-                source=FixSource.supervisor_request,
+                source=FixSource.qc_reject,
                 severity=severity,
                 minutes_spent=None,
                 origin_task_id=task.id,
-                qc_inspection_id=None,
+                qc_inspection_id=qc.id,
                 attachments=None,
             )
 
@@ -296,9 +305,10 @@ def apply_task_transition(
     stmt = pg_insert(TaskTransition).values(**values)
 
     if client_event_id is not None:
+        # IMPORTANT: conflict target must be (task_id, client_event_id)
         stmt = (
             stmt.on_conflict_do_nothing(
-                index_elements=[TaskTransition.org_id, TaskTransition.client_event_id],
+                index_elements=[TaskTransition.task_id, TaskTransition.client_event_id],
                 index_where=TaskTransition.client_event_id.is_not(None),
             )
             .returning(TaskTransition.id)
@@ -309,7 +319,7 @@ def apply_task_transition(
         if inserted_id is None:
             existing = db.execute(
                 select(TaskTransition).where(
-                    TaskTransition.org_id == org_id,
+                    TaskTransition.task_id == task_id,
                     TaskTransition.client_event_id == client_event_id,
                 )
             ).scalar_one()
@@ -318,16 +328,15 @@ def apply_task_transition(
         db.execute(stmt)
 
     # 7) ТОЛЬКО если transition реально вставился — применяем изменения к Task
-    # Assignment mutations are centralized here to keep FSM pure.
     if action in ("self_assign", "assign"):
-        # self_assign: executor picks from pool
-        # assign: lead/supervisor assigns from pool
         assign_to = payload_norm.get("assign_to") or payload_norm.get("user_id")
         if action == "self_assign":
             executor_id = actor_user_id
         else:
             if not assign_to:
-                raise TransitionNotAllowed("Action 'assign' requires payload.assign_to (user_id).")
+                raise TransitionNotAllowed(
+                    "Action 'assign' requires payload.assign_to (user_id)."
+                )
             executor_id = UUID(str(assign_to))
 
         _enforce_wip_limit(db, org_id=org_id, executor_id=executor_id, exclude_task_id=task.id)
@@ -335,17 +344,12 @@ def apply_task_transition(
         task.assigned_at = _now()
 
     elif action in ("shift_release", "recall_to_pool"):
-        # controlled return to pool
         task.assigned_to = None
         task.assigned_at = None
 
     elif action == "cancel":
-        # terminal: clear current owner (task is no longer in work)
         task.assigned_to = None
         task.assigned_at = None
-
-    # NOTE: 'unblock' does not touch assignment fields.
-    # NOTE: 'escalate' does not change status in FSM, but we still persist transition + bump row_version.
 
     task.status = to_status.value
     task.updated_at = _now()

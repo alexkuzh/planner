@@ -12,10 +12,12 @@ from sqlalchemy.exc import IntegrityError
 
 from app.models.task import Task, TaskStatus, FixSeverity
 from app.models.task_transition import TaskTransition
+from app.models.qc_inspection import QcInspection
 
 from app.fsm.task_fsm import TransitionNotAllowed
 
 from app.services.task_transition_service import apply_task_transition, VersionConflict, IdempotencyConflict
+
 
 
 
@@ -502,6 +504,56 @@ def test_idempotency_same_client_event_id_but_different_payload_is_rejected(db):
 
     transitions_after = _count_transitions(db, task.org_id, client_event_id)
     assert transitions_after == 1  # не задублилось
+
+
+def test_idempotency_same_client_event_id_but_different_action_is_rejected(db):
+    """Same client_event_id must represent the *same* request.
+
+    If action differs, we must raise IdempotencyConflict before even attempting FSM.
+    """
+    task = _make_task(db, status=TaskStatus.available, row_version=1)
+    actor = uuid4()
+    assignee = str(uuid4())
+    client_event_id = uuid4()
+
+    # act 1: first call ok
+    t1, fix1 = apply_task_transition(
+        db,
+        org_id=task.org_id,
+        actor_user_id=actor,
+        task_id=task.id,
+        action="assign",
+        expected_row_version=1,
+        payload={"assign_to": assignee},
+        client_event_id=client_event_id,
+    )
+    assert fix1 is None
+    assert t1.status == TaskStatus.assigned.value
+    assert t1.row_version == 2
+
+    transitions_before = _count_transitions(db, task.org_id, client_event_id)
+    assert transitions_before == 1
+
+    # act 2: same client_event_id but DIFFERENT action -> strict conflict
+    with pytest.raises(IdempotencyConflict):
+        apply_task_transition(
+            db,
+            org_id=task.org_id,
+            actor_user_id=actor,
+            task_id=task.id,
+            action="start",  # different action
+            expected_row_version=1,
+            payload={},
+            client_event_id=client_event_id,
+        )
+
+    # assert: no changes
+    db.refresh(task)
+    assert task.status == TaskStatus.assigned.value
+    assert task.row_version == 2
+
+    transitions_after = _count_transitions(db, task.org_id, client_event_id)
+    assert transitions_after == 1
 
 
 def test_idempotency_race_unique_violation_returns_existing(db, monkeypatch):
@@ -1188,3 +1240,195 @@ def test_idempotency_assign_uuid_vs_string_is_same_request(db):
     assert t2.row_version == t1.row_version  # no-op replay
     n = _count_transitions(db, task.org_id, client_event_id)
     assert n == 1
+
+
+def test_idempotency_replay_same_request_is_allowed(db):
+    """
+    Same client_event_id + same action + same payload
+    -> replay, not conflict, not new transition.
+    """
+    task = _make_task(db, status=TaskStatus.available, row_version=1)
+    actor = uuid4()
+    assignee = uuid4()
+    client_event_id = uuid4()
+
+    # act 1
+    t1, _ = apply_task_transition(
+        db,
+        org_id=task.org_id,
+        actor_user_id=actor,
+        task_id=task.id,
+        action="assign",
+        expected_row_version=1,
+        payload={"assign_to": str(assignee)},
+        client_event_id=client_event_id,
+    )
+
+    assert t1.status == TaskStatus.assigned.value
+    assert t1.row_version == 2
+
+    transitions_before = _count_transitions(db, task.org_id, client_event_id)
+    assert transitions_before == 1
+
+    # act 2: EXACT SAME REQUEST
+    t2, _ = apply_task_transition(
+        db,
+        org_id=task.org_id,
+        actor_user_id=actor,
+        task_id=task.id,
+        action="assign",
+        expected_row_version=1,
+        payload={"assign_to": str(assignee)},
+        client_event_id=client_event_id,
+    )
+
+    # replay expectations
+    assert t2.id == t1.id
+    assert t2.status == TaskStatus.assigned.value
+    assert t2.row_version == 2
+
+    transitions_after = _count_transitions(db, task.org_id, client_event_id)
+    assert transitions_after == 1
+
+def test_idempotency_payload_key_order_does_not_conflict(db):
+    """
+    Same semantic payload, different key order -> replay, not conflict.
+    """
+    task = _make_task(db, status=TaskStatus.available, row_version=1)
+    actor = uuid4()
+    assignee = uuid4()
+    client_event_id = uuid4()
+
+    payload1 = {"assign_to": str(assignee), "meta": {"a": 1, "b": 2}}
+    payload2 = {"meta": {"b": 2, "a": 1}, "assign_to": str(assignee)}  # same data, different order
+
+    t1, _ = apply_task_transition(
+        db,
+        org_id=task.org_id,
+        actor_user_id=actor,
+        task_id=task.id,
+        action="assign",
+        expected_row_version=1,
+        payload=payload1,
+        client_event_id=client_event_id,
+    )
+
+    transitions_before = _count_transitions(db, task.org_id, client_event_id)
+    assert transitions_before == 1
+
+    t2, _ = apply_task_transition(
+        db,
+        org_id=task.org_id,
+        actor_user_id=actor,
+        task_id=task.id,
+        action="assign",
+        expected_row_version=1,
+        payload=payload2,
+        client_event_id=client_event_id,
+    )
+
+    # replay
+    assert t2.id == t1.id
+    assert t2.row_version == t1.row_version
+
+    transitions_after = _count_transitions(db, task.org_id, client_event_id)
+    assert transitions_after == 1
+
+
+def test_idempotency_same_client_event_id_on_different_tasks_is_allowed(db):
+    """
+    client_event_id is scoped per task: same client_event_id on different tasks is allowed.
+    """
+    actor = uuid4()
+    assignee1 = uuid4()
+    assignee2 = uuid4()
+    client_event_id = uuid4()
+
+    task1 = _make_task(db, status=TaskStatus.available, row_version=1)
+    task2 = _make_task(db, status=TaskStatus.available, row_version=1)
+
+    t1, _ = apply_task_transition(
+        db,
+        org_id=task1.org_id,
+        actor_user_id=actor,
+        task_id=task1.id,
+        action="assign",
+        expected_row_version=1,
+        payload={"assign_to": str(assignee1)},
+        client_event_id=client_event_id,
+    )
+
+    t2, _ = apply_task_transition(
+        db,
+        org_id=task2.org_id,
+        actor_user_id=actor,
+        task_id=task2.id,
+        action="assign",
+        expected_row_version=1,
+        payload={"assign_to": str(assignee2)},
+        client_event_id=client_event_id,
+    )
+
+    assert t1.id != t2.id
+    assert t1.status == TaskStatus.assigned.value
+    assert t2.status == TaskStatus.assigned.value
+
+
+def test_idempotency_reject_same_client_event_id_is_replay_and_no_duplicates(db):
+    """
+    review_reject with same client_event_id must replay:
+    - no second qc_inspection
+    - no second fix-task
+    """
+    task = _make_task(db, status=TaskStatus.submitted, row_version=1, deliverable_id=uuid4())
+
+    actor = uuid4()
+    client_event_id = uuid4()
+
+    payload = {
+        "reason": "bad weld",
+        "severity": "major",
+        "fix_title": "Fix weld",
+    }
+
+    t1, fix1 = apply_task_transition(
+        db,
+        org_id=task.org_id,
+        actor_user_id=actor,
+        task_id=task.id,
+        action="review_reject",
+        expected_row_version=1,
+        payload=payload,
+        client_event_id=client_event_id,
+    )
+    assert fix1 is not None
+
+    # counts after first call
+    qc1 = db.execute(select(func.count()).select_from(QcInspection)).scalar_one()
+    fix_tasks1 = db.execute(
+        select(func.count()).select_from(Task).where(Task.id == fix1.id)
+    ).scalar_one()
+
+    # replay
+    t2, fix2 = apply_task_transition(
+        db,
+        org_id=task.org_id,
+        actor_user_id=actor,
+        task_id=task.id,
+        action="review_reject",
+        expected_row_version=1,
+        payload=payload,
+        client_event_id=client_event_id,
+    )
+
+    assert t2.id == t1.id
+    assert fix2 is not None
+    assert fix2.id == fix1.id
+
+    qc2 = db.execute(select(func.count()).select_from(QcInspection)).scalar_one()
+    fix_tasks2 = db.execute(
+        select(func.count()).select_from(Task).where(Task.id == fix1.id)
+    ).scalar_one()
+
+    assert qc2 == qc1
+    assert fix_tasks2 == fix_tasks1

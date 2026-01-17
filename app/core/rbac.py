@@ -1,55 +1,54 @@
-# app/core/rbac.py
 from __future__ import annotations
 
-from typing import Mapping, Set
+from dataclasses import dataclass
 
 
+@dataclass(frozen=True)
 class Forbidden(Exception):
-    """Raised when actor role is not allowed for an operation."""
-    pass
-
-
-def _aliases(prefix: str, actions: Set[str]) -> Set[str]:
     """
-    Build permission-key aliases for the same logical action.
-
-    In the codebase we may generate permissions in different formats, e.g.:
-      - "task.plan"
-      - "task.TaskAction.plan"
-
-    To avoid RBAC drift during MVP, we whitelist both formats.
+    Service-level RBAC exception.
+    API layer maps this to HTTP 403 deterministically.
     """
-    out: Set[str] = set()
-    for a in actions:
-        out.add(f"{prefix}.{a}")
-        out.add(f"{prefix}.TaskAction.{a}")
-    return out
+    detail: str
 
 
-# MVP roles (stringly-typed on purpose; later replace with Enum/JWT claims)
-# Keep permissions stable even if role names evolve.
-ALLOW: Mapping[str, Set[str]] = {
-    # ---- Deliverables ----
-    "deliverable.create": {"project_creator", "receiver"},
-    "deliverable.bootstrap": {"system"},
-    "deliverable.submit_to_qc": {"internal_controller"},
-    "deliverable.qc_decision": {"qc"},
-    "deliverable.signoff": {"lead", "responsible"},
+# Source of truth: current API actions (schemas/transition.py) + FSM Action enum.
+# If an action is missing here -> it MUST be forbidden (403) deterministically.
+ALLOW: dict[str, set[str]] = {
+    # Pool / operational
+    "task.unblock": {"system", "lead"},
+    "task.self_assign": {"executor", "lead"},
+    "task.assign": {"lead", "supervisor"},
+    "task.unassign": {"lead", "supervisor"},
+    "task.start": {"executor", "lead"},
+    "task.submit": {"executor", "lead"},
 
-    # ---- Tasks (FSM transitions) ----
-    # Note: accept both "task.<action>" and "task.TaskAction.<action>" to match
-    # whatever permission-key format a caller uses.
-    **{k: {"system", "lead"} for k in _aliases("task", {"plan"})},
-    **{k: {"lead", "supervisor"} for k in _aliases("task", {"assign", "unassign", "approve", "reject"})},
-    **{k: {"executor", "lead"} for k in _aliases("task", {"start", "submit"})},
+    # Review-ish (if present as task transitions)
+    "task.review_approve": {"lead", "supervisor"},
+    "task.review_reject": {"lead", "supervisor"},
 
-    # ---- Fix tasks ----
-    "fix.worker_initiative": {"qualified_worker", "executor", "lead", "supervisor"},
-    "fix.qc_reject": {"qc"},
+    # Pool management
+    "task.shift_release": {"lead", "supervisor"},
+    "task.recall_to_pool": {"lead", "supervisor"},
+    "task.escalate": {"executor", "lead", "supervisor"},
+
+    # Misc
+    "task.cancel": {"lead", "supervisor"},
 }
 
 
-def ensure_allowed(permission: str, role: str) -> None:
-    allowed = ALLOW.get(permission, set())
-    if role not in allowed:
-        raise Forbidden(f"Role '{role}' is not allowed for '{permission}'")
+def ensure_allowed(permission: str, actor_role: str) -> None:
+    allowed_roles = ALLOW.get(permission)
+    if not allowed_roles or actor_role not in allowed_roles:
+        raise Forbidden(
+            f"Forbidden: role '{actor_role}' is not allowed for '{permission}'"
+        )
+
+
+def is_allowed(permission: str, actor_role: str) -> bool:
+    roles = ALLOW.get(permission)
+    return bool(roles) and actor_role in roles
+
+
+def list_allowed_permissions_for_role(role: str) -> list[str]:
+    return sorted([perm for perm, roles in ALLOW.items() if role in roles])

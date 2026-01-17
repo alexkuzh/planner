@@ -1,4 +1,4 @@
-.PHONY: up infra api down ps logs logs-db db psql migrate revision kill-port restart pg-reset postman-run pg-top
+.PHONY: up infra api down ps logs logs-db db psql migrate revision kill-port restart pg-reset postman-run pg-top test-api-contract
 
 # Поднять только инфраструктуру (сейчас это Postgres)
 infra:
@@ -72,3 +72,8 @@ pg-top:
 	FROM pg_stat_statements \
 	ORDER BY total_exec_time DESC \
 	LIMIT 15;"
+
+# Contract test battery (API Hardening A1-A5)
+# Source of truth: pytest; Postman is for acceptance/debug.
+test-api-contract:
+	source .venv/bin/activate && pytest -q tests/api_contract

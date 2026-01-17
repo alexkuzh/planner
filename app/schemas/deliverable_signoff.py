@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 from app.models.deliverable_signoff import SignoffResult
 
@@ -40,8 +40,10 @@ class DeliverableSignoffCreate(BaseModel):
         examples=["Ок", "Не соответствует чертежу, требуется исправление"],
     )
 
-    model_config = {
-        "json_schema_extra": {
+    # A1 (API Hardening): forbid unknown fields in request bodies.
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
             "examples": [
                 {
                     "org_id": "11111111-1111-1111-1111-111111111111",
@@ -58,8 +60,8 @@ class DeliverableSignoffCreate(BaseModel):
                     "comment": "Найдены дефекты, требуется доработка",
                 },
             ]
-        }
-    }
+        },
+    )
 
 
 class DeliverableSignoffRead(BaseModel):

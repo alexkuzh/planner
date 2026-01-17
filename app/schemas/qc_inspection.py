@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_validator, ConfigDict
 
 from app.models.qc_inspection import QcResult
 
@@ -47,8 +47,10 @@ class QcDecisionRequest(BaseModel):
             raise ValueError("notes is required when result='rejected'")
         return self
 
-    model_config = {
-        "json_schema_extra": {
+    # A1 (API Hardening): forbid unknown fields in request bodies.
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
             "examples": [
                 {
                     "org_id": "11111111-1111-1111-1111-111111111111",
@@ -65,8 +67,8 @@ class QcDecisionRequest(BaseModel):
                     "notes": "Найдены дефекты: требуется исправление",
                 },
             ]
-        }
-    }
+        },
+    )
 
 
 class QcInspectionRead(BaseModel):

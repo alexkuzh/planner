@@ -440,3 +440,239 @@ Executor cannot return a task to pool from `in_progress`.
 #### Contributors (policy)
 - Contributors are invite-only (lead/supervisor or high-skill owner via delegated invites).
 - Contributors cannot change status and cannot submit.
+
+
+---
+
+# Database Testing & Integrity
+## Database Testing & Integrity Architecture
+
+This section is a **normative part of ARCHITECTURE.md** and describes how
+Planner guarantees **data integrity, test isolation, and invariant enforcement**
+at the database level.
+
+It is intentionally descriptive, not instructional.
+
+---
+
+## Architectural Goals
+
+Planner is designed so that:
+
+- PostgreSQL is the **source of truth**
+- Impossible states are rejected **by the database**
+- Service code cannot bypass invariants
+- Tests are deterministic, isolated, and reproducible
+- Schema + invariants evolve via Alembic only
+
+Testing infrastructure is therefore part of the **system architecture**.
+
+---
+
+## Database-First Integrity Model
+
+Planner follows a **database-first integrity approach**:
+
+- All critical invariants are enforced using:
+  - CHECK constraints
+  - NOT NULL constraints
+  - UNIQUE and partial UNIQUE indexes
+  - Foreign keys with explicit delete rules
+- Application code assumes the database is strict and defensive
+- Violations are treated as programmer errors, not runtime conditions
+
+This allows:
+- simpler service logic
+- higher confidence during refactoring
+- safe concurrent behavior
+
+---
+
+## Test Database Architecture
+
+### Separate Test Database
+
+Planner uses a **dedicated test database**:
+
+- Production: `planner`
+- Tests: `planner_test`
+
+Tests must never run against production data.
+
+The active database is validated before tests via a dedicated verification step.
+
+---
+
+### Alembic as the Only Schema Authority
+
+Schema management rules:
+
+- Alembic migrations are the **only way** to change schema
+- No `create_all()` or `drop_all()` in tests
+- No programmatic Alembic calls inside pytest
+- Test runs always target the **Alembic head**
+
+This guarantees that tests reflect the real production schema.
+
+---
+
+## Test Isolation Architecture (SQLAlchemy)
+
+### Transaction Model
+
+Each test runs inside a fully isolated transaction stack:
+
+1. Engine is created once per test session
+2. For each test:
+   - a dedicated connection is opened
+   - an **outer transaction** is started
+   - a SQLAlchemy session is bound to the connection
+   - a nested transaction (SAVEPOINT) is created
+3. After each test:
+   - the outer transaction is rolled back
+   - all changes are discarded
+
+A SQLAlchemy `after_transaction_end` listener recreates SAVEPOINTs
+to support multiple commits within a single test.
+
+### Why This Matters
+
+This model provides:
+
+- Perfect isolation between tests
+- High performance (no schema recreation)
+- Real constraint enforcement (unlike SQLite or mocks)
+- Elimination of flaky, order-dependent tests
+
+---
+
+## Factories as Architectural Boundary
+
+Direct model instantiation is **not considered safe** after DB-hardening.
+
+Factories define the **only supported way** to create test data.
+
+### Rationale
+
+After integrity hardening:
+
+- Many columns are NOT NULL
+- Many states are forbidden by CHECK constraints
+- Several relationships are enforced by FK + composite keys
+
+Factories guarantee that:
+- created data is schema-valid
+- invariants M1–M5 are respected by default
+- tests fail for the right reason
+
+### Required Factories
+
+The following factories are architectural primitives:
+
+- `make_project_template`
+- `make_task`
+- `make_allocation`
+- `make_qc_inspection`
+
+If a new invariant is introduced, the factory must be updated first.
+
+---
+
+## Database Invariants (M1–M5)
+
+### Closed Integrity Set
+
+The following invariants are enforced and considered **closed**:
+
+| Code | Invariant |
+|-----|----------|
+| M1 | Domain constraints (status, result, priority) |
+| M2 | Assignment consistency vs task status |
+| M3 | WIP = 1 (partial unique index) |
+| M4 | QC reject ↔ fix-task consistency |
+| M5 | Org-safe foreign keys (including allocations) |
+
+Each invariant:
+- is enforced in PostgreSQL
+- has a dedicated regression test
+- has a reversible Alembic migration
+
+---
+
+### Invariant Development Rule
+
+New invariants follow a strict sequence:
+
+1. Define invariant precisely
+2. Write a failing DB-level test
+3. Add constraint or index
+4. Add Alembic migration + downgrade
+5. Pass full test suite
+
+This prevents accidental weakening of guarantees.
+
+---
+
+## Idempotency as an Architectural Constraint
+
+Planner enforces idempotency at the database boundary.
+
+### Variant A (Replay)
+
+- Repeated requests always replay
+- Used for legacy or permissive flows
+
+### Variant B (Strict)
+
+- Scope: `(task_id, client_event_id)`
+- Canonical request normalization
+- Replay for identical canonical requests
+- Conflict only if canonical form differs
+
+Important:
+- Not all payload fields participate in canonicalization
+- Tests must reflect the real canonical contract
+
+---
+
+## Infrastructure Verification Step
+
+Before running tests, infrastructure correctness is validated:
+
+- connection targets `planner_test`
+- Alembic version equals head
+- critical tables exist
+- required foreign keys are present
+
+This step is mandatory and automated.
+
+---
+
+## Standard Test Execution
+
+The canonical test entrypoint is:
+
+```bash
+make test-db
+```
+
+Which performs:
+
+1. Alembic upgrade to head
+2. Infrastructure verification
+3. Full pytest run
+
+This sequence is required in CI and local development.
+
+---
+
+## Architectural Outcome
+
+With this architecture:
+
+- Database integrity is non-negotiable
+- Tests describe system contracts, not assumptions
+- Refactoring is safe and localized
+- Concurrency errors are prevented by design
+- The schema itself documents the business rules
+

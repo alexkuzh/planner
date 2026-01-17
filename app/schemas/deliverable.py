@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 from app.models.deliverable import DeliverableStatus
 
@@ -42,8 +42,10 @@ class DeliverableCreate(BaseModel):
         examples=["SN-2026-0001"],
     )
 
-    model_config = {
-        "json_schema_extra": {
+    # A1 (API Hardening): forbid unknown fields in request bodies.
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
             "examples": [
                 {
                     "org_id": "11111111-1111-1111-1111-111111111111",
@@ -53,8 +55,8 @@ class DeliverableCreate(BaseModel):
                     "serial": "SN-2026-0001",
                 }
             ]
-        }
-    }
+        },
+    )
 
 
 class DeliverableRead(BaseModel):

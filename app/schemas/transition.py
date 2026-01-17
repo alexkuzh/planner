@@ -4,7 +4,17 @@ from __future__ import annotations
 from typing import Annotated, Literal, Optional, Union
 from uuid import UUID
 
-from pydantic import BaseModel, Field, conint
+from pydantic import BaseModel, ConfigDict, Field, conint
+
+
+class StrictBaseModel(BaseModel):
+    """Strict request models: forbid unknown fields.
+
+    API Hardening (A1): remove "gray zones" by rejecting any extra keys in
+    request bodies and nested payloads.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
 
 # ============================================================================
@@ -12,11 +22,11 @@ from pydantic import BaseModel, Field, conint
 # ============================================================================
 
 
-class EmptyPayload(BaseModel):
+class EmptyPayload(StrictBaseModel):
     """Payload for actions where body is not required."""
 
 
-class AssignPayload(BaseModel):
+class AssignPayload(StrictBaseModel):
     """Payload for action=assign (leader assigns executor)."""
 
     assign_to: UUID = Field(
@@ -26,7 +36,7 @@ class AssignPayload(BaseModel):
     )
 
 
-class ReviewRejectPayload(BaseModel):
+class ReviewRejectPayload(StrictBaseModel):
     """Payload for action=review_reject.
 
     Возвращает задачу в работу (submitted -> in_progress). Опционально может породить fix-task
@@ -51,7 +61,7 @@ class ReviewRejectPayload(BaseModel):
     )
 
 
-class EscalatePayload(BaseModel):
+class EscalatePayload(StrictBaseModel):
     """Payload for action=escalate (no status change)."""
 
     message: str = Field(
@@ -67,7 +77,7 @@ class EscalatePayload(BaseModel):
 # ============================================================================
 
 
-class TransitionCommon(BaseModel):
+class TransitionCommon(StrictBaseModel):
     org_id: UUID = Field(
         ...,
         description="Организация (мультитенантность). Пока передаём явно, позже будет из auth.",

@@ -5,26 +5,16 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field
 
 from app.models.deliverable import DeliverableStatus
 
 
 class DeliverableCreate(BaseModel):
-    org_id: UUID = Field(
-        ...,
-        description="Организация (мультитенантность). Пока передаём явно, позже будет из auth.",
-        examples=["11111111-1111-1111-1111-111111111111"],
-    )
     project_id: UUID = Field(
         ...,
         description="Проект. Пока передаём явно, позже будет из auth/context.",
         examples=["22222222-2222-2222-2222-222222222222"],
-    )
-    created_by: UUID = Field(
-        ...,
-        description="Кто создал deliverable (на MVP передаём явно, позже будет из auth).",
-        examples=["33333333-3333-3333-3333-333333333333"],
     )
 
     deliverable_type: str = Field(
@@ -42,21 +32,18 @@ class DeliverableCreate(BaseModel):
         examples=["SN-2026-0001"],
     )
 
-    # A1 (API Hardening): forbid unknown fields in request bodies.
-    model_config = ConfigDict(
-        extra="forbid",
-        json_schema_extra={
+    model_config = {
+        "extra": "forbid",
+        "json_schema_extra": {
             "examples": [
                 {
-                    "org_id": "11111111-1111-1111-1111-111111111111",
                     "project_id": "22222222-2222-2222-2222-222222222222",
-                    "created_by": "33333333-3333-3333-3333-333333333333",
                     "deliverable_type": "box_v1",
                     "serial": "SN-2026-0001",
                 }
             ]
-        },
-    )
+        }
+    }
 
 
 class DeliverableRead(BaseModel):

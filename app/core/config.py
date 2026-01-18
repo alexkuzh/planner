@@ -6,6 +6,18 @@ class Settings(BaseSettings):
 
     app_name: str = "planner"
 
+    # ---------------------------------------------------------------------
+    # API contract / OpenAPI
+    # ---------------------------------------------------------------------
+
+    api_version: str = "2.0.0"
+    api_description: str = (
+        "Planner API (Contract v2).\n\n"
+        "Write endpoints are headers-first only. Required headers: "
+        "X-Org-Id, X-Actor-User-Id, X-Role.\n\n"
+        "Legacy body auth fields (org_id, actor_user_id, etc.) were removed in B2."
+    )
+
     env: str = "local"
     debug: bool = True
 

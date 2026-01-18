@@ -5,26 +5,16 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field
 
 from app.models.deliverable_signoff import SignoffResult
 
 
 class DeliverableSignoffCreate(BaseModel):
-    org_id: UUID = Field(
-        ...,
-        description="Организация (мультитенантность). Пока передаём явно, позже будет из auth.",
-        examples=["11111111-1111-1111-1111-111111111111"],
-    )
     project_id: UUID = Field(
         ...,
         description="Проект. Пока передаём явно, позже будет из auth/context.",
         examples=["22222222-2222-2222-2222-222222222222"],
-    )
-    signed_off_by: UUID = Field(
-        ...,
-        description="Кто подписывает (точка ответственности).",
-        examples=["33333333-3333-3333-3333-333333333333"],
     )
 
     result: SignoffResult = Field(
@@ -40,28 +30,24 @@ class DeliverableSignoffCreate(BaseModel):
         examples=["Ок", "Не соответствует чертежу, требуется исправление"],
     )
 
-    # A1 (API Hardening): forbid unknown fields in request bodies.
-    model_config = ConfigDict(
-        extra="forbid",
-        json_schema_extra={
+    # B2: headers-first only; forbid legacy fields in body
+    model_config = {
+        "extra": "forbid",
+        "json_schema_extra": {
             "examples": [
                 {
-                    "org_id": "11111111-1111-1111-1111-111111111111",
                     "project_id": "22222222-2222-2222-2222-222222222222",
-                    "signed_off_by": "33333333-3333-3333-3333-333333333333",
                     "result": "approved",
                     "comment": "Все задачи выполнены",
                 },
                 {
-                    "org_id": "11111111-1111-1111-1111-111111111111",
                     "project_id": "22222222-2222-2222-2222-222222222222",
-                    "signed_off_by": "33333333-3333-3333-3333-333333333333",
                     "result": "rejected",
                     "comment": "Найдены дефекты, требуется доработка",
                 },
             ]
         },
-    )
+    }
 
 
 class DeliverableSignoffRead(BaseModel):

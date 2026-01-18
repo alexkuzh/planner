@@ -134,9 +134,16 @@ class DeliverableBootstrapService:
                 child.parent_task_id = parent.id
 
         # 6) Создаём зависимости task_dependencies через mapping code -> task_id
+        # NOTE:
+        # Таблица task_dependencies может отсутствовать (в новых миграциях). В bootstrap она не должна
+        # ломать создание задач/обновление deliverable. Поэтому вставку зависимостей выполняем в SAVEPOINT.
+        deps_supported = True
+
         #    Храним именно UUID реальных задач.
         created_deps = 0
         for e in edges:
+            if not deps_supported:
+                break
             if e.predecessor_code not in task_by_code:
                 raise BootstrapError(f"Edge predecessor_code not found in nodes: {e.predecessor_code}")
             if e.successor_code not in task_by_code:

@@ -9,8 +9,11 @@ from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.exc import NoSuchTableError
 from sqlalchemy import inspect
 from sqlalchemy.dialects import postgresql
+
+
 
 # revision identifiers, used by Alembic.
 revision: str = '4d0d24229335'
@@ -21,33 +24,45 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     bind = op.get_bind()
-    insp = inspect(bind)
-    cols = {c["name"] for c in insp.get_columns("task_transitions")}
-    if "project_id" in cols:
+    insp = sa.inspect(bind)
+    try:
+        cols = {c["name"] for c in insp.get_columns("task_transitions")}
+    except NoSuchTableError:
+        # Fresh DB path: task_transitions not created yet at this point in the chain.
         return
 
-    # 1) add nullable column first
-    op.add_column("task_transitions", sa.Column("project_id", postgresql.UUID(as_uuid=True), nullable=True))
+        if "project_id" in cols:
+            return
 
-    # 2) backfill from tasks
-    op.execute("""
-        UPDATE task_transitions tt
-        SET project_id = t.project_id
-        FROM tasks t
-        WHERE t.id = tt.task_id
-    """)
+        # 1) add nullable column first
+        if "project_id" not in cols:
+            op.add_column("task_transitions", sa.Column("project_id", sa.Uuid(), nullable=True))# 2) backfill from tasks
+        op.execute("""
+            UPDATE task_transitions tt
+            SET project_id = t.project_id
+            FROM tasks t
+            WHERE t.id = tt.task_id
+        """)
 
-    # 3) make it NOT NULL
-    op.alter_column("task_transitions", "project_id", nullable=False)
+        # 3) make it NOT NULL
+        op.alter_column("task_transitions", "project_id", nullable=False)
 
-    # 4) optional but usually helpful index for queries by org+project
-    op.create_index(
-        "idx_task_transitions_org_project_time",
-        "task_transitions",
-        ["org_id", "project_id", "created_at"],
-    )
+        # 4) optional but usually helpful index for queries by org+project
+        op.create_index(
+            "idx_task_transitions_org_project_time",
+            "task_transitions",
+            ["org_id", "project_id", "created_at"],
+        )
 
 
 def downgrade() -> None:
-    op.drop_index("idx_task_transitions_org_project_time", table_name="task_transitions")
-    op.drop_column("task_transitions", "project_id")
+    bind = op.get_bind()
+    insp = sa.inspect(bind)
+    try:
+        cols = {c["name"] for c in insp.get_columns("task_transitions")}
+    except NoSuchTableError:
+        # Fresh DB path: task_transitions not created yet at this point in the chain.
+        return
+
+        op.execute(\'DROP INDEX IF EXISTS idx_task_transitions_org_project_time\')if "project_id" in cols:
+            op.drop_column("task_transitions", "project_id")

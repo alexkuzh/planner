@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.db import get_db
 from app.schemas.allocation import AllocationBatchRequest, AllocationOut
 from app.services.task_allocation_service import TaskAllocationService
-from app.api.deps import get_current_user_id
+from app.api.deps import ActorContext, get_actor_context, get_current_user_id
 from app.models.task import Task
 from app.models.deliverable import Deliverable
 
@@ -23,14 +23,17 @@ router = APIRouter(prefix="/allocations", tags=["allocations"])
 @router.post("/batch", response_model=list[AllocationOut])
 def create_batch(
     req: AllocationBatchRequest,
+    ctx: ActorContext = Depends(get_actor_context),
     db: Session = Depends(get_db),
-    actor_user_id: UUID = Depends(get_current_user_id),
 ):
+    org_id = ctx.org_id
+    actor_user_id = ctx.actor_user_id
+
     service = TaskAllocationService(db)
 
     try:
         rows = service.create_batch(
-            org_id=req.org_id,
+            org_id=org_id,
             project_id=req.project_id,
             work_date=req.work_date,
             shift_code=req.shift_code,
@@ -41,20 +44,27 @@ def create_batch(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
-    return [
-        AllocationOut(
-            id=r.id,
-            org_id=r.org_id,
-            project_id=r.project_id,
-            task_id=r.task_id,
-            work_date=r.work_date,
-            shift_code=r.shift_code,
-            allocated_to=r.allocated_to,
-            allocated_by=r.allocated_by,
-            note=r.note,
+    # NOTE: DB schema for task_allocations stores only (org_id, task_id, user_id, role, created_at).
+    # The batch payload contains additional scheduling/context fields; for B1 we echo them in response.
+    items_by_task: dict[UUID, dict] = {UUID(str(a["task_id"])): a for a in [a.model_dump() for a in req.allocations]}
+
+    out: list[AllocationOut] = []
+    for r in rows:
+        item = items_by_task.get(r.task_id, {})
+        out.append(
+            AllocationOut(
+                id=r.id,
+                org_id=r.org_id,
+                project_id=req.project_id,
+                task_id=r.task_id,
+                work_date=req.work_date,
+                shift_code=req.shift_code,
+                allocated_to=UUID(str(item.get("allocated_to", r.user_id))),
+                allocated_by=actor_user_id,
+                note=item.get("note"),
+            )
         )
-        for r in rows
-    ]
+    return out
 
 
 @router.get("/today", response_model=list[AllocationOut])
@@ -104,13 +114,13 @@ def list_for_shift(
             AllocationOut(
                 id=r.id,
                 org_id=r.org_id,
-                project_id=r.project_id,
+                project_id=project_id,
                 task_id=r.task_id,
-                work_date=r.work_date,
-                shift_code=r.shift_code,
-                allocated_to=r.allocated_to,
-                allocated_by=r.allocated_by,
-                note=r.note,
+                work_date=work_date,
+                shift_code=shift_code,
+                allocated_to=r.user_id,
+                allocated_by=r.user_id,
+                note=None,
 
                 deliverable_id=deliverable_id,
                 deliverable_type=d.deliverable_type if d else None,
@@ -166,13 +176,13 @@ def list_my(
             AllocationOut(
                 id=r.id,
                 org_id=r.org_id,
-                project_id=r.project_id,
+                project_id=project_id,
                 task_id=r.task_id,
-                work_date=r.work_date,
-                shift_code=r.shift_code,
-                allocated_to=r.allocated_to,
-                allocated_by=r.allocated_by,
-                note=r.note,
+                work_date=work_date,
+                shift_code="begin_of_week",
+                allocated_to=r.user_id,
+                allocated_by=r.user_id,
+                note=None,
 
                 deliverable_id=deliverable_id,
                 deliverable_type=d.deliverable_type if d else None,

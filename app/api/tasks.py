@@ -27,7 +27,7 @@ from app.models.task_event import TaskEvent
 from app.models.task_transition import TaskTransition
 from app.models.deliverable import Deliverable
 
-from app.api.deps import get_actor_role
+from app.api.deps import ActorContext, get_actor_context
 
 TASK_TRANSITION_OPENAPI_EXAMPLES = {
     "unblock": {
@@ -242,7 +242,7 @@ def create_task(data: TaskCreate, db: Session = Depends(get_db)):
 def transition_task(
     task_id: UUID,
     payload: TaskTransitionRequest = Body(..., openapi_examples=TASK_TRANSITION_OPENAPI_EXAMPLES),
-    actor_role: str = Depends(get_actor_role),
+    ctx: ActorContext = Depends(get_actor_context),
     db: Session = Depends(get_db),
 ):
     # --- Guard: QC actions are not allowed in Task FSM (Variant A) ---
@@ -257,17 +257,18 @@ def transition_task(
         )
     # RBAC: разрешение зависит от action
     try:
-        ensure_allowed(f"task.{payload.action}", actor_role)
+        ensure_allowed(f"task.{payload.action}", ctx.role)
     except Forbidden as e:
-        raise HTTPException(status_code=403, detail=str(e))
+        # B5: deterministic error contract
+        raise HTTPException(status_code=403, detail="forbidden")
 
     try:
         with db.begin():
             try:
                 task, fix_task = apply_task_transition(
                     db,
-                    org_id=payload.org_id,
-                    actor_user_id=payload.actor_user_id,
+                    org_id=ctx.org_id,
+                    actor_user_id=ctx.actor_user_id,
                     task_id=task_id,
                     action=payload.action,
                     expected_row_version=payload.expected_row_version,
@@ -275,7 +276,8 @@ def transition_task(
                     client_event_id=payload.client_event_id,
                 )
             except IdempotencyConflict as e:
-                raise HTTPException(status_code=409, detail=str(e))
+                # B5: deterministic error contract
+                raise HTTPException(status_code=409, detail="client_event_id conflict")
 
         return TaskTransitionResponse(
             task_id=task.id,
@@ -284,8 +286,8 @@ def transition_task(
             fix_task_id=fix_task.id if fix_task else None,
         )
 
-    except VersionConflict as e:
-        raise HTTPException(status_code=409, detail=str(e))
+    except VersionConflict:
+        raise HTTPException(status_code=409, detail="row_version mismatch")
     except TransitionNotAllowed as e:
         raise HTTPException(status_code=422, detail=str(e))
     except KeyError:

@@ -42,15 +42,14 @@ class TaskAllocationService:
             if task.status in ("done", "canceled"):
                 raise ValueError(f"Task is not allocatable in status: {task.status}")
 
+            # NOTE: DB schema for task_allocations is minimal and stores only:
+            #   org_id, task_id, user_id, role (+ created_at)
+            # Scheduling/context fields (project_id/work_date/shift_code/note/allocated_by) are not persisted.
             alloc = TaskAllocation(
                 org_id=org_id,
-                project_id=project_id,
                 task_id=task.id,
-                work_date=work_date,
-                shift_code=shift_code,
-                allocated_to=allocated_to,
-                allocated_by=allocated_by,
-                note=note,
+                user_id=allocated_to,
+                role="executor",
             )
 
             self.db.add(alloc)
@@ -67,13 +66,14 @@ class TaskAllocationService:
         work_date: date,
         shift_code: str,
     ) -> list[TaskAllocation]:
+        # task_allocations table doesn't contain project_id/work_date/shift_code.
+        # We filter by org_id and join tasks to apply project_id.
         return (
             self.db.query(TaskAllocation)
+            .join(Task, Task.id == TaskAllocation.task_id)
             .filter(
                 TaskAllocation.org_id == org_id,
-                TaskAllocation.project_id == project_id,
-                TaskAllocation.work_date == work_date,
-                TaskAllocation.shift_code == shift_code,
+                Task.project_id == project_id,
             )
             .order_by(TaskAllocation.created_at.desc())
             .all()
@@ -89,11 +89,11 @@ class TaskAllocationService:
     ) -> list[TaskAllocation]:
         return (
             self.db.query(TaskAllocation)
+            .join(Task, Task.id == TaskAllocation.task_id)
             .filter(
                 TaskAllocation.org_id == org_id,
-                TaskAllocation.project_id == project_id,
-                TaskAllocation.work_date == work_date,
-                TaskAllocation.allocated_to == user_id,
+                Task.project_id == project_id,
+                TaskAllocation.user_id == user_id,
             )
             .order_by(TaskAllocation.created_at.desc())
             .all()

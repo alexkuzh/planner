@@ -34,6 +34,13 @@ ALLOW: dict[str, set[str]] = {
 
     # Misc
     "task.cancel": {"lead", "supervisor"},
+
+    # Deliverables (consumer-facing workflow actions)
+    # NOTE: these permissions are enforced at API layer for deterministic 403 (B5).
+    "deliverable.bootstrap": {"system", "lead"},
+    "deliverable.signoff": {"system", "lead", "supervisor"},
+    "deliverable.submit_to_qc": {"system", "lead", "supervisor"},
+    "deliverable.qc_decision": {"system", "lead", "supervisor"},
 }
 
 

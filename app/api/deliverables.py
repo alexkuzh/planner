@@ -16,7 +16,7 @@ from app.models.deliverable_signoff import DeliverableSignoff, SignoffResult
 from app.models.qc_inspection import QcInspection, QcResult
 from app.models.task import Task, FixSeverity
 
-from app.api.deps import get_actor_role
+from app.api.deps import ActorContext, get_actor_context, get_actor_role
 from app.core.rbac import ensure_allowed, Forbidden
 
 from app.schemas.deliverable import DeliverableCreate, DeliverableRead
@@ -150,12 +150,13 @@ class DeliverableBootstrapResponse(BaseModel):
 @router.post("", response_model=DeliverableRead, status_code=status.HTTP_201_CREATED)
 def create_deliverable(
         data: DeliverableCreate = Body(..., openapi_examples=DELIVERABLE_CREATE_OPENAPI_EXAMPLES),
+        ctx: ActorContext = Depends(get_actor_context),
         db: Session = Depends(get_db),
     ):
     # Проверим уникальность serial в org (чтобы вернуть 409, а не 500)
     existing = db.execute(
         select(Deliverable).where(
-            Deliverable.org_id == data.org_id,
+            Deliverable.org_id == ctx.org_id,
             Deliverable.serial == data.serial,
         )
     ).scalar_one_or_none()
@@ -163,12 +164,12 @@ def create_deliverable(
         raise HTTPException(status_code=409, detail="Deliverable with this serial already exists in org")
 
     d = Deliverable(
-        org_id=data.org_id,
+        org_id=ctx.org_id,
         project_id=data.project_id,
         deliverable_type=data.deliverable_type,
         serial=data.serial,
         status=DeliverableStatus.open.value,
-        created_by=data.created_by,
+        created_by=ctx.actor_user_id,
     )
     db.add(d)
     db.commit()
@@ -207,6 +208,7 @@ def list_deliverables(org_id: UUID, project_id: UUID, db: Session = Depends(get_
 def create_signoff(
     deliverable_id: UUID,
     body: DeliverableSignoffCreate = Body(..., openapi_examples=SIGNOFF_OPENAPI_EXAMPLES),
+    ctx: ActorContext = Depends(get_actor_context),
     actor_role: str = Depends(get_actor_role),
     db: Session = Depends(get_db),
 ):
@@ -214,20 +216,21 @@ def create_signoff(
     try:
         ensure_allowed("deliverable.signoff", actor_role)
     except Forbidden as e:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+        # B5: deterministic error contract
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
 
     d = db.get(Deliverable, deliverable_id)
     if not d:
         raise HTTPException(status_code=404, detail="Deliverable not found")
 
-    if d.org_id != body.org_id or d.project_id != body.project_id:
+    if d.org_id != ctx.org_id or d.project_id != body.project_id:
         raise HTTPException(status_code=422, detail="org_id/project_id mismatch")
 
     s = DeliverableSignoff(
-        org_id=body.org_id,
+        org_id=ctx.org_id,
         project_id=body.project_id,
         deliverable_id=deliverable_id,
-        signed_off_by=body.signed_off_by,
+        signed_off_by=ctx.actor_user_id,
         result=body.result.value if hasattr(body.result, "value") else str(body.result),
         comment=body.comment,
     )
@@ -274,6 +277,7 @@ def list_signoffs(
 def submit_to_qc(
     deliverable_id: UUID,
     body: SubmitToQcRequest = Body(..., openapi_examples=SUBMIT_TO_QC_OPENAPI_EXAMPLES),
+    ctx: ActorContext = Depends(get_actor_context),
     actor_role: str = Depends(get_actor_role),
     db: Session = Depends(get_db),
 ):
@@ -281,13 +285,14 @@ def submit_to_qc(
     try:
         ensure_allowed("deliverable.submit_to_qc", actor_role)
     except Forbidden as e:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+        # B5: deterministic error contract
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
 
     d = db.get(Deliverable, deliverable_id)
     if not d:
         raise HTTPException(status_code=404, detail="Deliverable not found")
 
-    if d.org_id != body.org_id or d.project_id != body.project_id:
+    if d.org_id != ctx.org_id or d.project_id != body.project_id:
         raise HTTPException(status_code=422, detail="org_id/project_id mismatch")
 
     if d.status not in (DeliverableStatus.open.value, DeliverableStatus.qc_rejected.value):
@@ -306,7 +311,7 @@ def submit_to_qc(
     if last_signoff.result != SignoffResult.approved.value:
         raise HTTPException(status_code=422, detail="Last production sign-off is not approved")
 
-    _ = body.actor_user_id  # TODO: писать audit event submit_to_qc
+    _ = ctx.actor_user_id  # TODO: писать audit event submit_to_qc
 
     d.status = DeliverableStatus.submitted_to_qc.value
     db.add(d)
@@ -354,6 +359,7 @@ def list_qc_inspections(
 def qc_decision(
     deliverable_id: UUID,
     body: QcDecisionRequest = Body(..., openapi_examples=QC_DECISION_OPENAPI_EXAMPLES),
+    ctx: ActorContext = Depends(get_actor_context),
     actor_role: str = Depends(get_actor_role),
     db: Session = Depends(get_db),
 ):
@@ -361,13 +367,14 @@ def qc_decision(
     try:
         ensure_allowed("deliverable.qc_decision", actor_role)
     except Forbidden as e:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+        # B5: deterministic error contract
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
 
     d = db.get(Deliverable, deliverable_id)
     if not d:
         raise HTTPException(status_code=404, detail="Deliverable not found")
 
-    if d.org_id != body.org_id or d.project_id != body.project_id:
+    if d.org_id != ctx.org_id or d.project_id != body.project_id:
         raise HTTPException(status_code=422, detail="org_id/project_id mismatch")
 
     if d.status != DeliverableStatus.submitted_to_qc.value:
@@ -388,10 +395,10 @@ def qc_decision(
             responsible_user_id = last_approved_signoff.signed_off_by
 
     qc = QcInspection(
-        org_id=body.org_id,
+        org_id=ctx.org_id,
         project_id=body.project_id,
         deliverable_id=deliverable_id,
-        inspector_user_id=body.inspector_user_id,
+        inspector_user_id=ctx.actor_user_id,
         responsible_user_id=responsible_user_id,
         result=body.result.value if hasattr(body.result, "value") else str(body.result),
         notes=body.notes,
@@ -413,7 +420,7 @@ def qc_decision(
 
         svc.create_qc_reject_fix(
             deliverable=d,
-            actor_user_id=body.inspector_user_id,
+            actor_user_id=ctx.actor_user_id,
             qc_inspection_id=qc.id,
             title=fix_title,
             description=body.notes,
@@ -507,6 +514,7 @@ def get_dashboard(
 def bootstrap_deliverable(
     deliverable_id: UUID,
     body: DeliverableBootstrapRequest = Body(..., openapi_examples=DELIVERABLE_BOOTSTRAP_OPENAPI_EXAMPLES),
+    ctx: ActorContext = Depends(get_actor_context),
     actor_role: str = Depends(get_actor_role),
     db: Session = Depends(get_db),
 ):
@@ -514,17 +522,18 @@ def bootstrap_deliverable(
     try:
         ensure_allowed("deliverable.bootstrap", actor_role)
     except Forbidden as e:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+        # B5: deterministic error contract
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
 
     service = DeliverableBootstrapService(db)
 
     try:
         with db.begin():
             result = service.bootstrap(
-                org_id=body.org_id,
+                org_id=ctx.org_id,
                 project_id=body.project_id,
                 deliverable_id=deliverable_id,
-                actor_user_id=body.actor_user_id,
+                actor_user_id=ctx.actor_user_id,
             )
     except BootstrapError as e:
         raise HTTPException(status_code=422, detail=str(e))
@@ -540,17 +549,21 @@ def bootstrap_deliverable(
 def create_deliverable_fix(
     deliverable_id: UUID,
     cmd: Command[DeliverableFixPayload] = Body(..., openapi_examples=DELIVERABLE_FIX_OPENAPI_EXAMPLES),
+    ctx: ActorContext = Depends(get_actor_context),
     db: Session = Depends(get_db),
 ):
     deliverable = db.get(Deliverable, deliverable_id)
     if not deliverable:
         raise HTTPException(404, "Deliverable not found")
 
+    if deliverable.org_id != ctx.org_id:
+        raise HTTPException(404, "Deliverable not found")
+
     svc = TaskFixService(db)
 
     fix = svc.create_initiative_fix_for_deliverable(
         deliverable=deliverable,
-        actor_user_id=cmd.actor_user_id,
+        actor_user_id=ctx.actor_user_id,
         title=cmd.payload.title,
         description=cmd.payload.description,
         severity=cmd.payload.severity,

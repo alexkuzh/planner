@@ -4,17 +4,7 @@ from __future__ import annotations
 from typing import Annotated, Literal, Optional, Union
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, conint
-
-
-class StrictBaseModel(BaseModel):
-    """Strict request models: forbid unknown fields.
-
-    API Hardening (A1): remove "gray zones" by rejecting any extra keys in
-    request bodies and nested payloads.
-    """
-
-    model_config = ConfigDict(extra="forbid")
+from pydantic import BaseModel, Field, conint
 
 
 # ============================================================================
@@ -22,11 +12,11 @@ class StrictBaseModel(BaseModel):
 # ============================================================================
 
 
-class EmptyPayload(StrictBaseModel):
+class EmptyPayload(BaseModel):
     """Payload for actions where body is not required."""
 
 
-class AssignPayload(StrictBaseModel):
+class AssignPayload(BaseModel):
     """Payload for action=assign (leader assigns executor)."""
 
     assign_to: UUID = Field(
@@ -36,7 +26,7 @@ class AssignPayload(StrictBaseModel):
     )
 
 
-class ReviewRejectPayload(StrictBaseModel):
+class ReviewRejectPayload(BaseModel):
     """Payload for action=review_reject.
 
     Возвращает задачу в работу (submitted -> in_progress). Опционально может породить fix-task
@@ -61,7 +51,7 @@ class ReviewRejectPayload(StrictBaseModel):
     )
 
 
-class EscalatePayload(StrictBaseModel):
+class EscalatePayload(BaseModel):
     """Payload for action=escalate (no status change)."""
 
     message: str = Field(
@@ -77,17 +67,7 @@ class EscalatePayload(StrictBaseModel):
 # ============================================================================
 
 
-class TransitionCommon(StrictBaseModel):
-    org_id: UUID = Field(
-        ...,
-        description="Организация (мультитенантность). Пока передаём явно, позже будет из auth.",
-        examples=["11111111-1111-1111-1111-111111111111"],
-    )
-    actor_user_id: UUID = Field(
-        ...,
-        description="Кто выполняет действие. Пока передаём явно, позже будет из auth.",
-        examples=["33333333-3333-3333-3333-333333333333"],
-    )
+class TransitionCommon(BaseModel):
     expected_row_version: conint(ge=1) = Field(
         ...,
         description="Optimistic lock: ожидаемая версия строки задачи (начинается с 1)",
@@ -98,6 +78,9 @@ class TransitionCommon(StrictBaseModel):
         description="Idempotency key (UUID). Опционально.",
         examples=["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"],
     )
+
+    # B2: headers-first only; forbid legacy fields in body
+    model_config = {"extra": "forbid"}
 
 
 # ============================================================================

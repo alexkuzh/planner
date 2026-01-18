@@ -77,3 +77,27 @@ pg-top:
 # Source of truth: pytest; Postman is for acceptance/debug.
 test-api-contract:
 	source .venv/bin/activate && pytest -q tests/api_contract
+
+# ---------------------------------------------------------------------
+# E2E "ideal" runner (migrate planner_test -> parity check -> pytest)
+#
+# Defaults match alembic_test.ini and docker-compose.yml
+# Override if needed:
+#   make e2e DB_TEST="postgresql+psycopg://..." DB_MAIN="postgresql+psycopg://..."
+# ---------------------------------------------------------------------
+DB_MAIN ?= postgresql+psycopg://planner:planner@localhost:5432/planner
+DB_TEST ?= postgresql+psycopg://planner:planner@localhost:5432/planner_test
+ALEMBIC_TEST_INI ?= alembic_test.ini
+PYTEST_E2E_ARGS ?= tests/e2e
+
+.PHONY: e2e-gate e2e
+
+# Only check that planner_test has required schema (and optional MAIN/TEST revision parity)
+e2e-gate:
+	DB_MAIN="$(DB_MAIN)" DB_TEST="$(DB_TEST)" \
+		source .venv/bin/activate && python scripts/check_db_parity.py
+
+# One-command E2E: migrate planner_test, check parity, run pytest
+e2e:
+	DB_MAIN="$(DB_MAIN)" DB_TEST="$(DB_TEST)" ALEMBIC_TEST_INI="$(ALEMBIC_TEST_INI)" PYTEST_ARGS="$(PYTEST_E2E_ARGS)" \
+		bash scripts/run_e2e.sh

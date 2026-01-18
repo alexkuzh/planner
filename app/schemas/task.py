@@ -10,9 +10,7 @@ from app.models.task import TaskStatus, TaskKind
 
 
 class TaskCreate(BaseModel):
-    org_id: UUID
     project_id: UUID
-    created_by: UUID
     title: str = Field(min_length=1, max_length=300)
     description: str | None = None
     priority: int = 0
@@ -36,6 +34,9 @@ class TaskCreate(BaseModel):
             raise ValueError("deliverable_id is required when is_milestone=true")
 
         return self
+
+    # B2: headers-first only; forbid legacy fields in body
+    model_config = {"extra": "forbid"}
 
 
 class TaskUpdate(BaseModel):

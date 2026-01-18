@@ -8,13 +8,16 @@ class AllocationItem(BaseModel):
     allocated_to: UUID
     note: str | None = None
 
+    model_config = {"extra": "forbid"}
+
 
 class AllocationBatchRequest(BaseModel):
-    org_id: UUID
     project_id: UUID
     work_date: date
     shift_code: str = Field(pattern="^(begin_of_week|end_of_week)$")
     allocations: list[AllocationItem] = Field(min_length=1)
+
+    model_config = {"extra": "forbid"}
 
 
 class AllocationOut(BaseModel):

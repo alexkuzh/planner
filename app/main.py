@@ -11,7 +11,12 @@ from app.api.allocations import router as allocations_router
 from app.api.deliverables import router as deliverables_router
 from app.core.config import settings
 
-app = FastAPI(title=settings.app_name)
+# Contract v2 (B3): OpenAPI must reflect headers-only auth context.
+app = FastAPI(
+    title=settings.app_name,
+    version=settings.api_version,
+    description=settings.api_description,
+)
 
 OPEN_PATHS = {"/docs", "/openapi.json", "/redoc", "/favicon.ico", "/health"}
 
@@ -40,17 +45,40 @@ def custom_openapi():
         routes=app.routes,
     )
 
-    # X-Role header as apiKey security scheme
+    # Headers-only auth context: document required headers via apiKey schemes.
     schema.setdefault("components", {}).setdefault("securitySchemes", {})
-    schema["components"]["securitySchemes"]["XRole"] = {
+    schemes = schema["components"]["securitySchemes"]
+
+    schemes["XRole"] = {
         "type": "apiKey",
         "in": "header",
         "name": "X-Role",
         "description": "MVP RBAC: set actor role (e.g. system, lead, qc, internal_controller, supervisor, executor).",
     }
 
-    # Apply globally (optional). If you want only some endpoints—remove this.
-    schema["security"] = [{"XRole": []}]
+    schemes["XOrgId"] = {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Org-Id",
+        "description": "Organization context (UUID). Required for protected endpoints.",
+    }
+
+    schemes["XActorUserId"] = {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Actor-User-Id",
+        "description": "Actor user id (UUID). Required for protected endpoints.",
+    }
+
+    # Apply globally (AND): all three headers are required for protected endpoints.
+    schema["security"] = [{"XRole": [], "XOrgId": [], "XActorUserId": []}]
+
+    # Public endpoints: remove security requirement explicitly.
+    for path in ["/health"]:
+        if path in schema.get("paths", {}):
+            for _method, op in schema["paths"][path].items():
+                if isinstance(op, dict):
+                    op.pop("security", None)
 
     app.openapi_schema = schema
     return app.openapi_schema
